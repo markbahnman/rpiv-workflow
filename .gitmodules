@@ -1,0 +1,12 @@
+[submodule "research/inspirations/spec-kitty"]
+	path = research/inspirations/spec-kitty
+	url = https://github.com/spec-kitty/spec-kitty.git
+[submodule "research/inspirations/rpiv-mono"]
+	path = research/inspirations/rpiv-mono
+	url = https://github.com/juicesharp/rpiv-mono.git
+[submodule "research/inspirations/openspec"]
+	path = research/inspirations/openspec
+	url = https://github.com/Fission-AI/OpenSpec.git
+[submodule "research/inspirations/beads"]
+	path = research/inspirations/beads
+	url = https://github.com/gastownhall/beads.git

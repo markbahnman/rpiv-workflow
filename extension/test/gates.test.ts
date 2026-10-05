@@ -1,0 +1,341 @@
+import assert from "node:assert/strict";
+import { test } from "node:test";
+import type { Bead, BeadComment, Beads, RpivMeta } from "../src/beads.ts";
+import { recordDeviation } from "../src/deviation.ts";
+import {
+  DEVIATION_CHECK,
+  DEVIATION_LABEL,
+  deriveTracked,
+  findPlanPath,
+  GATE_LABEL,
+  gateBlocks,
+  gatePlan,
+  installTrackedWorkflows,
+  makeDeviationCheck,
+  makePlanGate,
+  PLAN_GATE,
+  REIMPLEMENT_LABEL,
+  REIMPLEMENTED_LABEL,
+  scriptStage,
+  setDeviationRoute,
+  type WorkflowLike,
+} from "../src/gates.ts";
+import { applyPlanReview, type WorkCtx, workApprove, workNext, workReject, workStart } from "../src/work.ts";
+
+// ---------------------------------------------------------------- workflow derivation
+
+const route = (targets: string[], fn: (ctx: { pass: boolean }) => string) => Object.assign(fn, { targets, readsData: false });
+
+function buildLike(): WorkflowLike {
+  return {
+    name: "build",
+    description: "the real one",
+    start: "goal",
+    stages: { goal: {}, plan: {}, "code-cite-check": {}, "code-grade": {}, implement: {}, "scope-check": {}, validate: {} },
+    edges: {
+      goal: "plan",
+      plan: "code-cite-check",
+      "code-cite-check": route(["implement", "code-grade"], (c) => (c.pass ? "implement" : "code-grade")),
+      "code-grade": "implement",
+      implement: "scope-check",
+      "scope-check": "validate",
+      validate: "stop",
+    },
+  };
+}
+
+test("deriveTracked adds plan-approval before implement and deviation-check after it", () => {
+  const g: Record<symbol, unknown> = {};
+  const base = buildLike();
+  const t = deriveTracked(base, { planGate: scriptStage(async () => {}), deviationCheck: scriptStage(async () => {}) }, g)!;
+  assert.equal(t.name, "build-rpivw");
+  assert.equal(t.edges["code-grade"], PLAN_GATE);
+  assert.equal(t.edges[PLAN_GATE], "implement");
+  assert.equal(t.edges.implement, DEVIATION_CHECK);
+  const cite = t.edges["code-cite-check"] as ((c: { pass: boolean }) => string) & { targets: string[]; readsData: boolean };
+  assert.equal(cite({ pass: true }), PLAN_GATE);
+  assert.deepEqual(cite.targets, [PLAN_GATE, "code-grade"]);
+  assert.equal(cite.readsData, false, "route metadata preserved");
+
+  const check = t.edges[DEVIATION_CHECK] as ((c: unknown) => string) & { targets: string[] };
+  assert.deepEqual(check.targets, ["scope-check", "implement"]);
+  assert.equal(check({}), "scope-check", "default: continue to implement's original next stage");
+  setDeviationRoute("reimplement", g);
+  assert.equal(check({}), "implement", "a reimplement decision routes back once");
+  assert.equal(check({}), "scope-check", "the decision is consumed");
+
+  assert.equal(base.edges["code-grade"], "implement", "base workflow not mutated");
+  assert.equal(deriveTracked({ ...base, stages: { goal: {} } }, { deviationCheck: {} }), undefined, "no implement stage → no variant");
+});
+
+test("without a plan gate only deviation-check is added; function edges out of implement are kept", () => {
+  const g: Record<symbol, unknown> = {};
+  const ship: WorkflowLike = {
+    name: "ship",
+    start: "plan",
+    stages: { plan: {}, implement: {}, validate: {}, fix: {} },
+    edges: { plan: "implement", implement: route(["validate", "fix"], (c) => (c.pass ? "validate" : "fix")), validate: "stop", fix: "stop" },
+  };
+  const t = deriveTracked(ship, { deviationCheck: {} }, g)!;
+  assert.equal(t.name, "ship-rpivw");
+  assert.equal(t.edges.plan, "implement");
+  assert.ok(!(PLAN_GATE in t.stages));
+  const check = t.edges[DEVIATION_CHECK] as ((c: { pass: boolean }) => string) & { targets: string[] };
+  assert.deepEqual(check.targets, ["validate", "fix", "implement"]);
+  assert.equal(check({ pass: false }), "fix", "original routing function still decides");
+});
+
+test("installTrackedWorkflows derives now if the base exists, else waits via a provider", async () => {
+  const BUILT = Symbol.for("@juicesharp/rpiv-workflow:built-ins");
+  const PROV = Symbol.for("@juicesharp/rpiv-workflow:built-in-providers:providers");
+  const stages = () => ({ deviationCheck: {} });
+
+  const now: Record<symbol, unknown> = { [BUILT]: [buildLike()] };
+  installTrackedWorkflows(["build"], stages, { g: now });
+  assert.deepEqual((now[BUILT] as WorkflowLike[]).map((w) => w.name), ["build", "build-rpivw"]);
+  installTrackedWorkflows(["build"], stages, { g: now });
+  assert.equal((now[BUILT] as WorkflowLike[]).length, 2, "re-install replaces by name");
+
+  const later: Record<symbol, unknown> = {};
+  installTrackedWorkflows(["build"], stages, { g: later, waitMs: 2000 });
+  setTimeout(() => (later[BUILT] as WorkflowLike[]).push(buildLike()), 100);
+  await (later[PROV] as (() => Promise<void>)[])[0]();
+  assert.deepEqual((later[BUILT] as WorkflowLike[]).map((w) => w.name), ["build", "build-rpivw"]);
+
+  const missing: string[] = [];
+  const none: Record<symbol, unknown> = {};
+  installTrackedWorkflows(["build", "polish"], stages, { g: none, waitMs: 120, required: ["build"], onMissing: (n) => missing.push(n) });
+  await (none[PROV] as (() => Promise<void>)[])[0]();
+  assert.deepEqual(missing, ["build"], "only configured bases warn");
+});
+
+test("findPlanPath prefers plan artifacts from input or named channels", () => {
+  const fs = (path: string) => ({ handle: { kind: "fs", path } });
+  assert.equal(
+    findPlanPath({
+      cwd: ".",
+      input: { artifacts: [fs(".rpiv/artifacts/verdicts/v.json")] },
+      state: { named: { plan: [{ artifacts: [fs(".rpiv\\artifacts\\plans\\p1.md")] }], splice: [{ artifacts: [fs(".rpiv/artifacts/plans/p2.md")] }] } },
+    }),
+    ".rpiv/artifacts/plans/p2.md",
+  );
+  assert.equal(findPlanPath({ cwd: "." }), undefined);
+  assert.equal(gateBlocks("Ad-hoc gate blocking rw-5b3.1\n\nReason: x"), "rw-5b3.1");
+  assert.equal(gatePlan("Ad-hoc gate blocking rw-1\n\nReason: .rpiv/artifacts/plans/p.md (run r1)"), ".rpiv/artifacts/plans/p.md");
+});
+
+// ---------------------------------------------------------------- fake bd
+
+function world() {
+  const beads = new Map<string, Bead>();
+  const calls: string[] = [];
+  let n = 0;
+  const api: Beads = {
+    create: async () => ({}) as Bead,
+    show: async (id) => {
+      const b = beads.get(id);
+      if (!b) throw new Error(`no ${id}`);
+      return b;
+    },
+    ready: async () => [...beads.values()].filter((b) => b.status === "open" && b.issue_type !== "gate"),
+    list: async () => [],
+    claim: async () => {},
+    patchRpiv: async (_id, f): Promise<RpivMeta> => f({}),
+    comment: async (id, text) => void calls.push(`comment ${id}: ${text}`),
+    comments: async (): Promise<BeadComment[]> => [],
+    close: async () => {},
+    createGate: async (p) => {
+      const g: Bead = {
+        id: `rw-g${++n}`,
+        title: p.title,
+        description: `Ad-hoc gate blocking ${p.blocks}\n\nReason: ${p.reason}`,
+        status: "open",
+        issue_type: "gate",
+        await_id: p.awaitId,
+        labels: p.labels,
+      };
+      beads.set(g.id, g);
+      return g;
+    },
+    gates: async () => [...beads.values()].filter((b) => b.issue_type === "gate"),
+    resolveGate: async (id) => {
+      beads.get(id)!.status = "closed";
+      calls.push(`resolve ${id}`);
+    },
+    updateLabels: async (id, add, remove) => {
+      const b = beads.get(id)!;
+      b.labels = [...(b.labels ?? []).filter((l) => !remove.includes(l)), ...add];
+    },
+  };
+  beads.set("rw-5b3", { id: "rw-5b3", title: "CSV export", status: "in_progress", issue_type: "feature", labels: ["project:k"] });
+  return { api, beads, calls };
+}
+
+const wctx = (api: Beads): WorkCtx => ({ beads: api, project: { key: "k", name: "dash" }, projectNames: { k: "dash" } });
+
+// ---------------------------------------------------------------- plan gate
+
+test("plan gate: halts with a new gate, halts again while open, passes once approved", async () => {
+  const w = world();
+  const notes: string[] = [];
+  let handed: string | undefined = "run-1";
+  const gate = makePlanGate({
+    beads: w.api,
+    takeRunId: () => handed,
+    linkFor: async () => ({ bead: "rw-5b3", projectKey: "k" }),
+    notify: (m) => notes.push(m),
+    reviewLines: async (_cwd, plan, id) => [`annotate: /work review ${id}`, `open: ${plan}`],
+  });
+  const ctx = { cwd: "/co", input: { artifacts: [{ handle: { kind: "fs", path: ".rpiv/artifacts/plans/p.md" } }] } };
+
+  await assert.rejects(gate(ctx), /waiting for plan approval \(gate rw-g1\): \/work review rw-g1 · \/work approve rw-g1/);
+  const g = w.beads.get("rw-g1")!;
+  assert.equal(g.await_id, "run-1");
+  assert.deepEqual(g.labels, [GATE_LABEL, "project:k"]);
+  assert.equal(
+    notes[0],
+    "rpivw: plan ready for review: .rpiv/artifacts/plans/p.md\nannotate: /work review rw-g1\nopen: .rpiv/artifacts/plans/p.md\n" +
+      "/work approve rw-g1 [notes]  ·  /work reject rw-g1 <notes>",
+  );
+  await assert.rejects(gate(ctx), /waiting for plan approval \(gate rw-g1\)/);
+  assert.equal((await w.api.gates()).length, 1, "no duplicate gate");
+
+  assert.match(await workNext(wctx(w.api), ""), /awaiting you \(dash\):\n {2}rw-g1 {2}Plan approval: CSV export/);
+  const rej = await workReject(wctx(w.api), "rw-g1 split the export into two phases");
+  assert.match(rej, /next: \/skill:revise \.rpiv\/artifacts\/plans\/p\.md split the export into two phases/);
+  await assert.rejects(workApprove(wctx(w.api), "rw-g1 --reimplement"), /applies to deviation gates/);
+
+  const ok = await workApprove(wctx(w.api), "rw-g1 looks good, watch memory");
+  assert.deepEqual(ok, { message: "plan approved (rw-g1 for rw-5b3)", runId: "run-1" });
+  assert.ok(w.calls.includes("comment rw-5b3: plan approved: looks good, watch memory (gate rw-g1)"));
+  await gate(ctx);
+  await assert.rejects(workApprove(wctx(w.api), "rw-g1"), /already resolved/);
+  await assert.rejects(workApprove(wctx(w.api), "rw-5b3"), /isn't an rpivw gate/);
+
+  handed = undefined;
+  await assert.rejects(gate(ctx), /couldn't identify this run/, "fails closed");
+});
+
+test("plan gate fails closed for runs not linked to a bead", async () => {
+  const w = world();
+  const gate = makePlanGate({ beads: w.api, takeRunId: () => "run-x", linkFor: async () => ({}), notify: () => {} });
+  await assert.rejects(gate({ cwd: "/co" }), /isn't linked to a bead/);
+});
+
+test("plannotator review: close keeps the gate, annotations ask for a revise, approve resolves and resumes", async () => {
+  const w = world();
+  const gate = makePlanGate({
+    beads: w.api,
+    takeRunId: () => "run-1",
+    linkFor: async () => ({ bead: "rw-5b3", projectKey: "k" }),
+    notify: () => {},
+  });
+  await assert.rejects(gate({ cwd: "/co", input: { artifacts: [{ handle: { kind: "fs", path: ".rpiv/artifacts/plans/p.md" } }] } }));
+
+  const closed = await applyPlanReview(wctx(w.api), "rw-g1", { feedback: "", exit: true });
+  assert.match(closed.message, /closed without a decision; rw-g1 stays open/);
+  assert.equal(closed.runId, undefined);
+  assert.equal(w.beads.get("rw-g1")!.status, "open");
+
+  const changes = await applyPlanReview(wctx(w.api), "rw-g1", { feedback: "Phase 2: use KV, not D1" });
+  assert.equal(changes.revise, "/skill:revise .rpiv/artifacts/plans/p.md Phase 2: use KV, not D1");
+  assert.equal(changes.runId, undefined);
+  assert.equal(w.beads.get("rw-g1")!.status, "open", "annotations keep the gate open");
+  assert.ok(w.calls.includes("comment rw-5b3: plan changes requested in plannotator (gate rw-g1):\nPhase 2: use KV, not D1"));
+
+  const ok = await applyPlanReview(wctx(w.api), "rw-g1", { approved: true, feedback: "watch bundle size" });
+  assert.deepEqual(ok, { message: "plan approved in plannotator (rw-g1 for rw-5b3)", runId: "run-1" });
+  assert.equal(w.beads.get("rw-g1")!.status, "closed");
+  assert.ok(w.calls.includes("comment rw-5b3: plan approved in plannotator: watch bundle size (gate rw-g1)"));
+  await assert.rejects(applyPlanReview(wctx(w.api), "rw-g1", { approved: true }), /already resolved/, "a late second decision is refused");
+});
+
+// ---------------------------------------------------------------- deviations
+
+const devDeps = (api: Beads, notes: string[], runId: string | undefined = "run-1") => ({
+  beads: api,
+  runId,
+  link: async () => ({ bead: "rw-5b3", projectKey: "k" }),
+  minorPolicy: "notify" as const,
+  notify: (m: string) => void notes.push(m),
+});
+
+test("work_deviation: minor logs and notifies; major opens a deviation gate and tells the model to stop", async () => {
+  const w = world();
+  const notes: string[] = [];
+  const minor = await recordDeviation({ severity: "minor", found: "paginator already exists", impact: "phase 2 smaller", proposal: "continue", phase: "2" }, devDeps(w.api, notes));
+  assert.match(minor.text, /Continue implementing/);
+  assert.equal(minor.gateId, undefined);
+  assert.ok(w.calls.some((c) => /deviation\(minor\) \[phase 2\], run run-1: found: paginator already exists/.test(c)));
+  assert.match(notes[0], /minor deviation on rw-5b3 \[phase 2\]/);
+
+  const quiet: string[] = [];
+  await recordDeviation({ severity: "minor", found: "x", impact: "y", proposal: "continue" }, { ...devDeps(w.api, quiet), minorPolicy: "log" });
+  assert.deepEqual(quiet, [], "minorPolicy log stays quiet");
+
+  const major = await recordDeviation({ severity: "major", found: "reports are paginated server-side", impact: "phases 3-4", proposal: "revise" }, devDeps(w.api, notes));
+  assert.equal(major.gateId, "rw-g1");
+  assert.match(major.text, /Stop implementing now/);
+  const g = w.beads.get("rw-g1")!;
+  assert.deepEqual(g.labels, [DEVIATION_LABEL, "project:k"]);
+  assert.equal(g.await_id, "run-1");
+  assert.equal(g.title, "Deviation: CSV export");
+
+  const none = await recordDeviation({ severity: "major", found: "x", impact: "y", proposal: "revise" }, { ...devDeps(w.api, notes), runId: undefined });
+  assert.match(none.text, /No tracked rpiv run/);
+});
+
+test("deviation-check halts while a major deviation is open; approve continues, --reimplement loops once", async () => {
+  const w = world();
+  const g: Record<symbol, unknown> = {};
+  const routeAfter = () => {
+    const t = deriveTracked(buildLike(), { deviationCheck: {} }, g)!;
+    return (t.edges[DEVIATION_CHECK] as (c: unknown) => string)({});
+  };
+  const check = makeDeviationCheck({ beads: w.api, takeRunId: () => "run-1", linkFor: async () => ({ bead: "rw-5b3" }), notify: () => {} }, g);
+
+  await check({ cwd: "/co" });
+  assert.equal(routeAfter(), "scope-check", "no deviations: continue");
+
+  await recordDeviation({ severity: "major", found: "server-side pagination", impact: "3-4", proposal: "revise" }, devDeps(w.api, []));
+  await assert.rejects(check({ cwd: "/co" }), /major deviation awaiting your decision: \/work approve rw-g1 .*--reimplement/);
+  assert.match(await workNext(wctx(w.api), ""), /rw-g1 {2}Deviation: CSV export {2}→ {2}\/work approve rw-g1 \[notes\] to continue/);
+  await assert.rejects(workReject(wctx(w.api), "rw-g1 nope"), /is a deviation/);
+
+  const r = await workApprove(wctx(w.api), "rw-g1 --reimplement plan revised for streaming");
+  assert.equal(r.message, "deviation: re-implement with the revised plan (rw-g1 for rw-5b3)");
+  assert.ok(w.beads.get("rw-g1")!.labels!.includes(REIMPLEMENT_LABEL));
+
+  await check({ cwd: "/co" }); // resumed after approval
+  assert.equal(routeAfter(), "implement", "routes back to implement");
+  assert.ok(w.beads.get("rw-g1")!.labels!.includes(REIMPLEMENTED_LABEL), "decision consumed");
+  await check({ cwd: "/co" }); // after the re-implement pass
+  assert.equal(routeAfter(), "scope-check", "only once");
+});
+
+test("deviation-check passes unlinked runs; plain approve of a deviation continues", async () => {
+  const w = world();
+  const g: Record<symbol, unknown> = {};
+  await makeDeviationCheck({ beads: w.api, takeRunId: () => undefined, linkFor: async () => ({}), notify: () => {} }, g)({ cwd: "/co" });
+  await recordDeviation({ severity: "major", found: "f", impact: "i", proposal: "continue" }, devDeps(w.api, []));
+  const r = await workApprove(wctx(w.api), "rw-g1 fine as is");
+  assert.equal(r.message, "deviation: continue as planned (rw-g1 for rw-5b3)");
+  assert.ok(w.calls.includes("comment rw-5b3: deviation: continue as planned: fine as is (gate rw-g1)"));
+});
+
+// ---------------------------------------------------------------- start mapping
+
+test("/work start runs tracked bases as <name>-rpivw", async () => {
+  const w = world();
+  w.beads.set("rw-9", { id: "rw-9", title: "T", status: "open", issue_type: "feature", labels: ["project:k"] });
+  const c = wctx(w.api);
+  const reopen = () => void (w.beads.get("rw-9")!.status = "open");
+  assert.match((await workStart(c, "rw-9 build", {})).command, /^\/wf build-rpivw /);
+  reopen();
+  assert.match((await workStart(c, "rw-9", {})).command, /^\/wf ship-rpivw /, "default ship is tracked too");
+  reopen();
+  w.beads.get("rw-9")!.metadata = { rpiv: { workflow: "build-gated" } };
+  assert.match((await workStart(c, "rw-9", {})).command, /^\/wf build-rpivw /, "old -gated runs map to the new name");
+  reopen();
+  assert.match((await workStart(c, "rw-9 my-custom", {})).command, /^\/wf my-custom /, "untracked workflows run as-is");
+});

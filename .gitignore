@@ -1,0 +1,20 @@
+# Generated HTML reports (regenerate with the html-report skill)
+out/
+
+# Local workflow artifacts from mock runs (the workflow itself keeps these local)
+.rpiv/
+.rpivw/
+.beads/
+.backlog/
+
+# Per-machine agent notes (template: CLAUDE.local.example.md)
+CLAUDE.local.md
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Claude Code session worktrees
+.claude/worktrees/
