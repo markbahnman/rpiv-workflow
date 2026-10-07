@@ -234,10 +234,15 @@ gate point:
    reports `stopped at <gate>`.
 2. `/work approve <gate> [notes]` resolves the gate (`bd gate resolve`), adds any
    notes as a bead comment, and resumes `/wf @<run-id>`.
-3. rpiv's resume re-runs the halted stage. The gate is now closed, so the stage passes
-   and the run continues. Approval notes go into the next stage's prompt.
-4. `/work reject <gate> <notes>` sends the run to `revise` (or `amend`) with the
-   notes, then a fresh gate.
+3. rpiv's resume re-runs the halted stage. The gate is now closed, so the stage passes, the
+   driver's notes are recorded in `metadata.rpiv.approvals[<gate>]`, and the run continues.
+   The same stage appends those notes once to the plan the gate recorded (marked
+   `<!-- rpivw:notes <gate> -->`), so they reach the implement lane in the artifact it already
+   reads rather than through a prompt the extension doesn't own. A resume replays the stage, so
+   the append is marker-guarded.
+4. `/work reject <gate> <notes>` records the requested changes and starts
+   `/skill:revise <plan> <notes>` itself. The gate stays open, so the revised plan comes back
+   to the same gate for approval.
 
 **Verify:** the cleanest way for a script stage to halt in a way that is resumable
 (throwing gives `FAIL_SCRIPT_THREW`, and the resume re-runs that stage). Also check
@@ -350,6 +355,13 @@ M0–M2 make the minimum usable system. M3–M4 cover the two gaps no existing t
 
 ## Revision log
 
+- 2026-10-05: M3 gaps closed. Approval and deviation notes ride in the plan body (one marked
+  section, appended by the stage that took the decision), not in a prompt: implement is wired
+  by rpiv-pi (`acts({ loop: …, reads: ["plans"] })`), so the plan file is the only channel we
+  are sure the model sees. The "why" stays split as designed — commit message + bead comment
+  keep the trail, the plan carries only the instruction to implement. `/work reject` now opens
+  the revise instead of printing the command, and gate notices list the plan with a `file://`
+  link (a rendered link arrives with M5).
 - 2026-10-01: First draft, after the driver's Phase 0 answers.
 - 2026-10-04: M3 built. Tracked `<name>-rpivw` workflows: plan-approval (configured) + deviation-check (always) script stages spliced into rpiv-pi’s live built-ins. Front matter is stamped under one `rpivw:` block. The design was adjusted from the original "revision log in commit messages + bead comments": both exist, plus `--reimplement` routing.
 - 2026-10-03: M2 built. Runs link to beads by run name (`<bead>--r<n>`), not `trigger.ref`. `/work start` sends `/wf` through `pi.sendUserMessage` so the run keeps its detached lane.

@@ -5,9 +5,10 @@ at the end of every session.
 
 ## Current phase
 
-**Phase 3 (prototype). M0–M2 verified live. M3 built; the plan gate is verified live, the
-deviation path and plannotator approval are not yet. Next: make the repo portable so it can be
-tried on another machine (the driver's work laptop), then M3's exit check, M5, M4.**
+**Phase 3 (prototype). M0–M2 verified live. M3 built and its gaps closed 2026-10-05; the plan
+gate is verified live, the deviation path and plannotator approval are not yet. Next: make the repo
+portable so it can be tried on another machine (the driver's work laptop), then M3's exit check, M5,
+M4.**
 
 ## Roadmap
 
@@ -16,13 +17,22 @@ tried on another machine (the driver's work laptop), then M3's exit check, M5, M
 | 0. Orientation and survey | README/CLAUDE.md, report tooling, inspiration deep dive, landscape, needs, scenarios | Done (2026-09-28) |
 | 1. Decisions and thin-layer design | Record the driver's decisions. Design the Pi extension joining rpiv, beads, and the artifact store. | Draft done (2026-10-01), in review |
 | 2. Mock workflows | Replay scenarios 1–6 on the chosen stack (rpiv + beads) and answer research 05's mock questions | Planned |
-| 3. Prototype (M0–M5) | Build the extension milestone by milestone (research 05 → Build order) | M0 done; M1, M2 verified live; M3 built (2026-10-04), awaiting a live run. M4 next. |
+| 3. Prototype (M0–M5) | Build the extension milestone by milestone (research 05 → Build order) | M0 done; M1, M2 verified live; M3 built (2026-10-04) with its gaps closed (2026-10-05), awaiting a live run. M4 next. |
 | 4. Living specs and delegation (M6+) | Living specs, model tiers, independent verifiers, cost tracking | Planned |
 
 Phases 2 and 3 interleave: M0–M2 have to exist before the mocks can run for real.
 
 ## Done
 
+- 2026-10-05: **M3 gaps closed (3 of 3).** Your notes at a gate now reach the implement lane:
+  the decision is recorded in `metadata.rpiv.approvals[<gate>]`, and the stage that took it
+  appends a marked `## Reviewer notes` section once to the plan the gate holds — the artifact
+  implement already reads, since rpiv-pi wires implement as `acts({ loop: …, reads: ["plans"] })`.
+  Appending is marker-guarded because a resume replays the halted stage. Works for plan gates and
+  for `--reimplement` on a deviation gate. `/work reject <gate> <notes>` now starts
+  `/skill:revise <plan> <notes>` itself instead of printing the command. `/work next` lists the plan
+  a gate is holding, with a `file://` link (a link to the *rendered* plan still comes with M5).
+  78 tests.
 - 2026-09-28: Initialized submodules (spec-kitty and openspec need `core.longpaths` on Windows).
 - 2026-09-28: Wrote `README.md`, `CLAUDE.md`, `PROGRESS.md`, and `.gitignore`.
 - 2026-09-28: Built the `html-report` skill (`.claude/skills/html-report/`).
@@ -147,8 +157,10 @@ Phases 2 and 3 interleave: M0–M2 have to exist before the mocks can run for re
 2. **M3 exit check (driver):** a `major` `work_deviation` in a live `build-rpivw` run parks it after implement, shows in
    `/work status` and `/work next`, and continues via `/work approve` and `--reimplement`. Also: Approve in plannotator
    resumes a run.
-3. **M3 gaps:** approval notes into the next stage's prompt; `/work reject` starting the revise; a link to a rendered plan
-   in the gate notice (with M5).
+3. **M3 gaps:** ~~approval notes into the next stage's prompt~~ (2026-10-05: notes ride in the plan
+   body; see Decisions), ~~`/work reject` starting the revise~~ (2026-10-05), ~~a link to a rendered
+   plan in the gate notice~~ — `/work next` now shows the plan and a `file://` link; the *rendered*
+   plan link needs M5's report rendering, so it lands with item 4.
 4. **M5 reports**, then **M4 split** (research 05).
 5. M1 leftovers: a run from a git worktree; rpiv scope-check vs. submodule workspaces (report upstream?).
 6. Contract tests against a pinned rpiv (research 05 → Risks 1).
@@ -174,6 +186,7 @@ Phases 2 and 3 interleave: M0–M2 have to exist before the mocks can run for re
 | 2026-10-03 | Extension name **`rpivw`** (for now). Source lives in **this repo under `extension/`**. The store lives separately at `~/rpivw`. | Keep the tool and the data apart | Driver |
 | 2026-10-03 | Store remote: a **private GitHub repo** (`<user>/rpivw-store`) | Driver's choice | Driver |
 | 2026-10-05 | **No local workaround for Herdr agent state.** Don't emit `herdr:blocked` around runs, don't report to Herdr's socket ourselves, and don't rely on a Pi pane's Herdr state to mean "a run is in flight". Revisit only if an integration gains `herdr:busy` (then rpivw emits it). | The only channel integration v9 consumes is `blocked`, which means "needs a human" and fires notifications/waits; socket-level reporting collides with herdr#4697 (a child reporter can permanently mute the root). Run progress is already readable via `/work status`, the store, and reports. | Driver; research 07 |
+| 2026-10-05 | **A gate decision's notes ride in the plan body**, as one marker-guarded `## Reviewer notes` section appended by the stage that took the decision. The *why* stays in the store commit message and the bead comments. | rpiv-pi owns implement's wiring (`acts({ loop: …, reads: ["plans"] })`), so the plan file is the only channel we know the model reads; a prompt we don't own can't be relied on. The marker keeps a replayed resume from duplicating the section. | Driver; research 05 M3 → Revision log |
 | 2026-10-03 | Install bd **1.3.1** and dolt **2.2.0** via mise, both pinned | beads pins Dolt 2.2.0 because of a 2.3.x regression. Pinning bd guards against schema migrations. | Research 06 |
 | 2026-10-03 | **One beads database for all projects**, with a `project:<key>` label per bead | Dolt allows one database per remote ref, and there is one store remote | Research 06 |
 | *(proposed)* | Mount the store at `.rpiv/artifacts` via a directory junction | rpiv hardcodes that path | Research 05 M1 |

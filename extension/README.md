@@ -99,8 +99,9 @@ Verified on rpiv-workflow 2.12's real runner: implement → deviation-check (sto
   `/wf build` stays ungated. At the gate the run creates a beads `human` gate blocking the bead,
   notifies you, and stops (`stopped at plan-approval`). `/work next` lists it under
   "awaiting you". `/work approve <gate> [notes]` resolves it and resumes the run, which re-runs the
-  gate and continues into implement. `/work reject <gate> <notes>` records the requested changes,
-  keeps the gate open, and prints the `/skill:revise …` command to run before approving.
+  gate, puts your notes into the plan (below), and continues into implement. `/work reject <gate>
+  <notes>` records the requested changes, keeps the gate open, and starts `/skill:revise <plan>
+  <notes>` so the plan is being edited while you wait; approve it again when it reads right.
   `/work review [<gate>]` opens the waiting plan in plannotator's review-gate UI (when its Pi
   extension is installed), through plannotator's event-bus API (`plannotator:request`, `annotate`
   with `gate: true`). **Approve** resolves our gate and resumes the run (notes go on the bead);
@@ -110,6 +111,15 @@ Verified on rpiv-workflow 2.12's real runner: implement → deviation-check (sto
   else first draft → now). The gate's notice carries the same lines.
   Verified against rpiv-workflow 2.12's real runner (halt → resume halts again → approve →
   resume completes) and rpiv's validator (the derived workflows add no issues).
+- **Your notes reach the implement lane.** A decision's notes are recorded on the bead
+  (`metadata.rpiv.approvals[<gate>]`), and the stage that took the decision appends them once to
+  the plan the gate holds, under a `## Reviewer notes` heading marked with
+  `<!-- rpivw:notes <gate> -->`, with one line telling the model they win over the plan where they
+  conflict. So the notes travel in the artifact implement already reads, and a resume can't
+  duplicate them. The revised plan then shows your words, and the bead, the plan, and the store's
+  commit history each keep their own part of the trail (the *why* stays in the commit message and
+  the bead comments; the plan carries only the instruction). A `deviation` gate works the same way
+  when you `/work approve <gate> --reimplement`.
 - **Safe in rpiv's child sessions.** rpiv runs each stage in a child session that loads
   extensions from disk. rpivw recognizes a child by its session directory
   (`.rpiv/workflows/runs/<run-id>/sessions`) and leaves the launcher's lifecycle registration,
@@ -161,6 +171,9 @@ rpiv-workflow 2.11 and 2.12; startup warns on other versions.
 | `/work next [--all]` | In-progress and ready beads for this project (or every project). Epics are listed separately. |
 | `/work start <bead> [ship\|build\|<workflow>] [--force]` | Claim the bead and start the linked `/wf` run. Refuses beads from other projects, in-progress beads (resume with `/wf @<run>`), epics, and closed beads unless `--force`. |
 | `/work status [<bead>]` | No bead: store, project, mount, and in-progress beads. With a bead: phase, runs, artifacts, recent notes. |
+| `/work review [<gate>]` | Open the plan a gate is holding: plannotator when installed, a `file://` link, and a `hunk diff` of its changes. |
+| `/work approve <gate> [notes] [--reimplement]` | Approve the plan (or decide a deviation) and resume its run. Your notes go on the bead and into the plan implement reads. On a deviation gate, `--reimplement` sends the run back to implement once. |
+| `/work reject <gate> <notes>` | Record what should change and start `/skill:revise <plan> <notes>`. The gate stays open until you approve the revised plan. |
 | `/work init [name] [--migrate] [--git]` | Register this repo (or rename it), pin its key, mount the store, and create `project.md`. Creates the git repo if missing (asks first, or `--git`). Commits the store. |
 | `/work mount` | Re-create the junction (for example after a `git clean -x`) |
 | `/work sync` | Push the store: git plus `bd dolt push` |
