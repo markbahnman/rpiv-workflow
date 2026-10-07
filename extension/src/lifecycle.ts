@@ -14,6 +14,7 @@ import type { Beads } from "./beads.ts";
 import { piAgentDir } from "./config.ts";
 import { artifactBucket, beadFromRunName, readRunHeader } from "./runs.ts";
 import { readStampId, stampFile } from "./stamp.ts";
+import { formatStopReport, stopReport } from "./stopreport.ts";
 import type { StoreRepo } from "./store.ts";
 import { commitMessage } from "./store.ts";
 
@@ -57,7 +58,8 @@ export interface RunResult {
   stagesCompleted: number;
   success: boolean;
   error?: string;
-  termination?: string;
+  /** rpiv-workflow types.ts RunTermination. */
+  termination?: { status: string; error?: string };
 }
 export interface LifecycleListeners {
   onWorkflowStart?(ctx: LifecycleContext): void | Promise<void>;
@@ -258,8 +260,13 @@ export function createListeners(deps: BridgeDeps): LifecycleListeners {
           await b.patchRpiv(id, (m) => ({ ...m, phase: "done" }));
           await b.close(id, `${ctx.workflow} run ${runId} succeeded`);
         } else {
-          const why = (result.error ?? result.termination ?? "stopped").split("\n")[0].slice(0, 300);
-          await b.comment(id, `run ${runId} (${ctx.workflow}) stopped: ${why}. Fix, then resume with /wf @${runId}`);
+          // The trail names the failing checks, their findings, and the file to edit.
+          const report = stopReport(p.root, runId);
+          if (report) await b.comment(id, formatStopReport(report, { full: true }));
+          else {
+            const why = (result.error ?? result.termination?.error ?? "stopped").split("\n")[0].slice(0, 300);
+            await b.comment(id, `run ${runId} (${ctx.workflow}) stopped: ${why}. Fix, then resume with /wf @${runId}`);
+          }
         }
       });
       if (deps.pushOnEnd(p.key)) {

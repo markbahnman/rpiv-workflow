@@ -174,6 +174,7 @@ rpiv-workflow 2.11 and 2.12; startup warns on other versions.
 | `/work review [<gate>]` | Open the plan a gate is holding: plannotator when installed, a `file://` link, and a `hunk diff` of its changes. |
 | `/work approve <gate> [notes] [--reimplement]` | Approve the plan (or decide a deviation) and resume its run. Your notes go on the bead and into the plan implement reads. On a deviation gate, `--reimplement` sends the run back to implement once. |
 | `/work reject <gate> <notes>` | Record what should change and start `/skill:revise <plan> <notes>`. The gate stays open until you approve the revised plan. |
+| `/work why [<run-id>]` | Why a run stopped (the newest stopped run in this checkout by default): each failed check with its findings, the grader's fix advice and verdict file, the artifact to edit, and the `/wf @<run>` to resume. The same report, shortened, appears when any run stops, and goes on the bead as a comment. |
 | `/work init [name] [--migrate] [--git]` | Register this repo (or rename it), pin its key, mount the store, and create `project.md`. Creates the git repo if missing (asks first, or `--git`). Commits the store. |
 | `/work mount` | Re-create the junction (for example after a `git clean -x`) |
 | `/work sync` | Push the store: git plus `bd dolt push` |

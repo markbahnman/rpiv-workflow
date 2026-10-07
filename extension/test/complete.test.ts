@@ -21,7 +21,7 @@ const beads = [
 const values = (items: { value: string }[]) => items.map((i) => i.value);
 
 test("subcommands complete from an empty or partial first word, with a trailing space", () => {
-  assert.deepEqual(values(completeWork("", undefined)), ["new ", "next ", "start ", "status ", "review ", "approve ", "reject ", "init ", "mount ", "sync ", "setup "]);
+  assert.deepEqual(values(completeWork("", undefined)), ["new ", "next ", "start ", "status ", "review ", "approve ", "reject ", "why ", "init ", "mount ", "sync ", "setup "]);
   assert.deepEqual(values(completeWork("st", undefined)), ["start ", "status "]);
   assert.deepEqual(values(completeWork("n", undefined)), ["new ", "next "]);
   assert.match(completeWork("sy", undefined)[0].description!, /push the store/);

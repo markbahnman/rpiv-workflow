@@ -22,6 +22,7 @@ export const SUBCOMMANDS: { name: string; hint: string }[] = [
   { name: "review", hint: "open a waiting plan (plannotator, file link, changes)" },
   { name: "approve", hint: "approve a plan and resume its run" },
   { name: "reject", hint: "request plan changes" },
+  { name: "why", hint: "why the last run stopped, and what to fix [<run-id>]" },
   { name: "init", hint: "register this repo [name] [--migrate] [--git]" },
   { name: "mount", hint: "re-create the .rpiv/artifacts link" },
   { name: "sync", hint: "push the store (git + beads)" },

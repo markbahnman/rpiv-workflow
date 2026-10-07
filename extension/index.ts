@@ -43,6 +43,7 @@ import { recordDeviation } from "./src/deviation.ts";
 import { Type } from "typebox";
 import { absPlan, detectReviewTools, planDiffCommand, requestPlanGateReview, reviewLines, storePlanPath } from "./src/review.ts";
 import { setupStore } from "./src/setup.ts";
+import { formatStopReport, latestStoppedRun, stopReport } from "./src/stopreport.ts";
 import { openStore } from "./src/store.ts";
 import { applyPlanReview, isDeviationGate, openGates, parseArgs, type WorkCtx, workApprove, workBeadStatus, workInProgress, workNew, workNext, workReject, workStart } from "./src/work.ts";
 
@@ -61,6 +62,7 @@ const USAGE = [
   "/work review [<gate>]              open a plan waiting for approval (plannotator if installed, file link, hunk diff of changes)",
   "/work approve <gate> [notes] [--reimplement]  approve a plan (or decide a deviation) and resume the run",
   "/work reject <gate> <notes>        request plan changes and start /skill:revise (the gate stays open until you approve it)",
+  "/work why [<run-id>]               why a run stopped: failed checks, findings, the file to edit, how to resume",
   "/work init [name] [--migrate] [--git]  register this repo (or rename it) and mount its store folder;\n                                   creates the git repo if missing (asks, or --git)",
   "/work mount                        (re)create the .rpiv/artifacts junction",
   "/work sync                         push the store (git + beads) to its remote",
@@ -327,6 +329,17 @@ export default function rpivw(pi: ExtensionAPI) {
       onStageStart: (stage, lctx) => {
         if (stage.name === PLAN_GATE || stage.name === DEVIATION_CHECK) gateRuns.set(lctx.cwd, lctx.runId);
       },
+      // rpiv's halt toast says "see the stage's verdict"; follow it with what failed and
+      // which file to edit. Any checkout, registered or not: it only reads the run trail.
+      onWorkflowEnd: (result, lctx) => {
+        if (result.success) return;
+        try {
+          const report = stopReport(lctx.cwd, result.runId ?? lctx.runId);
+          if (report) notify(formatStopReport(report), "warning");
+        } catch (e) {
+          notify(`rpivw: couldn't summarize the stopped run: ${(e as Error).message}`, "warning");
+        }
+      },
     });
     g[DISPOSE_KEY] = () => {
       disposeMain();
@@ -417,7 +430,7 @@ export default function rpivw(pi: ExtensionAPI) {
   });
 
   pi.registerCommand("work", {
-    description: "rpivw: work tracking (new, next, start, status, review, approve, reject) and the artifact store (init, mount, sync)",
+    description: "rpivw: work tracking (new, next, start, status, review, approve, reject, why) and the artifact store (init, mount, sync)",
     getArgumentCompletions: async (argText) => {
       const needsBeads = /^(status|start|review|approve|reject) |^new .*--parent /.test(argText);
       const data = needsBeads ? await beadsForCompletion() : undefined;
@@ -439,6 +452,14 @@ export default function rpivw(pi: ExtensionAPI) {
         }
         const r = await setupStore(root, { remote: flags.remote || undefined, prefix: flags.prefix || undefined }, resolveBd()?.path);
         say(`rpivw: ${r.lines.join("\n")}`, r.ok ? "info" : "warning");
+        return;
+      }
+
+      if (sub === "why") {
+        const runId = rest[0]?.replace(/^@/, "") ?? latestStoppedRun(ctx.cwd);
+        const report = runId ? stopReport(ctx.cwd, runId) : undefined;
+        if (report) say(formatStopReport(report, { full: true }), "warning");
+        else say(rest[0] ? `rpivw: run ${runId} hasn't stopped on a failure (or has no trail here).` : "rpivw: no stopped run in this checkout.");
         return;
       }
 
