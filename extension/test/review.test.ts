@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { piAgentDir } from "../src/config.ts";
 import { gitOut } from "../src/exec.ts";
-import { absPlan, detectReviewTools, planDiffCommand, requestPlanGateReview, reviewLines, storePlanPath } from "../src/review.ts";
+import { absPlan, detectReviewTools, planDiffCommand, plannotatorListening, requestPlanGateReview, reviewLines, storePlanPath } from "../src/review.ts";
 
 test("storePlanPath maps a gate's plan path into the store", () => {
   const store = join("C:", "Users", "me", "rpivw");
@@ -69,6 +69,21 @@ test("requestPlanGateReview sends plannotator an annotate request in review-gate
   assert.match(sent[0].data.requestId, /^rpivw-/);
   sent[0].data.respond({ status: "handled", result: { feedback: "", approved: true } });
   assert.deepEqual(await pending, { status: "handled", result: { feedback: "", approved: true } });
+});
+
+test("plannotatorListening: a loaded plannotator answers review-status; a silent bus times out", async () => {
+  const sent: { channel: string; data: any }[] = [];
+  const answering = {
+    emit: (channel: string, data: any) => {
+      sent.push({ channel, data });
+      data.respond({ status: "handled", result: { status: "missing" } });
+    },
+  };
+  assert.equal(await plannotatorListening(answering), true);
+  assert.equal(sent[0].channel, "plannotator:request");
+  assert.equal(sent[0].data.action, "review-status");
+  assert.equal(typeof sent[0].data.payload.reviewId, "string", "plannotator answers 'error' without a reviewId");
+  assert.equal(await plannotatorListening({ emit: () => {} }, 20), false);
 });
 
 test("piAgentDir follows PI_CODING_AGENT_DIR like Pi, else ~/.pi/agent", () => {

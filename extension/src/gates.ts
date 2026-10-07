@@ -54,7 +54,35 @@ export const baseName = (name: string) => name.replace(/-(rpivw|gated)$/, "");
 
 const IMPLEMENT = "implement";
 
-/** Route every edge into `before` through `gate` first. Returns the number of routes rewired. */
+// rpiv-workflow routing-dsl.ts ROUTE_NOTE. An edge sets it on itself during a pick
+// (setRouteNote); the runner reads and clears it on the edge the workflow holds
+// (takeRouteNote). A decision `stop` that carries a note halts the run as a blocked
+// gate; without one the run finishes as completed (runner/chain-advance.ts
+// isBlockedGateStop). So a wrapper must hand on its inner edge's note for every pick.
+const ROUTE_NOTE = Symbol.for("rpiv.workflow.routeNote");
+const setNote = (fn: EdgeFn, note: string | undefined) => {
+  (fn as unknown as Record<symbol, unknown>)[ROUTE_NOTE] = note;
+};
+const noteOf = (fn: EdgeFn) => (fn as unknown as Record<symbol, string | undefined>)[ROUTE_NOTE];
+
+/**
+ * Call `inner` on behalf of `outer` (the edge the workflow holds): clear any stale note on
+ * `inner` first, then move the note this pick set (or none) onto `outer`. Edges run
+ * synchronously and the runner takes the note in the same tick, so nothing interleaves.
+ */
+function delegate(inner: EdgeFn, outer: EdgeFn, ctx: unknown): string {
+  setNote(inner, undefined);
+  const pick = inner(ctx);
+  setNote(outer, noteOf(inner));
+  setNote(inner, undefined);
+  return pick;
+}
+
+/**
+ * Route every edge into `before` through `gate` first. Returns the number of routes rewired.
+ * Only function edges that can return `before` are wrapped (an edge without declared
+ * targets is wrapped to be safe); every other edge stays the same function object.
+ */
 function routeThrough(edges: Record<string, Edge>, start: string, before: string, gate: string): { edges: Record<string, Edge>; start: string; rewired: number } {
   let rewired = 0;
   const out: Record<string, Edge> = {};
@@ -62,14 +90,17 @@ function routeThrough(edges: Record<string, Edge>, start: string, before: string
     if (typeof target === "string") {
       if (target === before) rewired++;
       out[from] = target === before ? gate : target;
-    } else if (typeof target === "function") {
+    } else if (typeof target === "function" && (!target.targets || target.targets.includes(before))) {
       const orig = target;
       const wrapped: EdgeFn = Object.assign((ctx: unknown) => {
-        const t = orig(ctx);
+        const t = delegate(orig, wrapped, ctx);
         return t === before ? gate : t;
       }, orig);
-      if (orig.targets) wrapped.targets = orig.targets.map((t) => (t === before ? gate : t));
-      if (orig.targets?.includes(before)) rewired++;
+      setNote(wrapped, undefined); // Object.assign copied whatever note orig held at derive time
+      if (orig.targets) {
+        wrapped.targets = orig.targets.map((t) => (t === before ? gate : t));
+        rewired++;
+      }
       out[from] = wrapped;
     } else out[from] = target;
   }
@@ -77,14 +108,43 @@ function routeThrough(edges: Record<string, Edge>, start: string, before: string
   return { edges: out, start: start === before ? gate : start, rewired };
 }
 
-/** The decision deviation-check hands to its own outgoing edge (edges get no run id or cwd). */
-export function setDeviationRoute(route: "continue" | "reimplement", g: Record<symbol, unknown> = globalThis as never) {
-  g[ROUTE_SLOT] = { route, at: Date.now() };
+type Route = "continue" | "reimplement";
+type RouteSlot = Record<string, { route: Route; at: number }>;
+const routeSlot = (g: Record<symbol, unknown>): RouteSlot => (g[ROUTE_SLOT] ??= {}) as RouteSlot;
+
+/**
+ * The decision deviation-check hands to its own outgoing edge, keyed by run: the slot is
+ * process-wide, and rpiv awaits the stage-end listeners before it evaluates the edge, so
+ * another run's check can run in between.
+ */
+export function setDeviationRoute(runId: string, route: Route, g: Record<symbol, unknown> = globalThis as never) {
+  routeSlot(g)[runId] = { route, at: Date.now() };
 }
-function takeDeviationRoute(g: Record<symbol, unknown>): "continue" | "reimplement" {
-  const v = g[ROUTE_SLOT] as { route: "continue" | "reimplement"; at: number } | undefined;
-  g[ROUTE_SLOT] = undefined;
+function takeDeviationRoute(g: Record<symbol, unknown>, runId: string | undefined): Route {
+  if (!runId) return "continue";
+  const slot = routeSlot(g);
+  const v = slot[runId];
+  delete slot[runId];
   return v && Date.now() - v.at < 60_000 ? v.route : "continue";
+}
+
+/** An rpiv output envelope; every one carries its run id (rpiv-workflow output.ts, OutputMeta.runId). */
+interface Envelope {
+  meta?: { runId?: string };
+}
+
+/** The run id on the envelopes a stage or edge can see: `primary` first, then the run's latest output, then any named channel. */
+export function runIdFrom(
+  primary: Envelope | undefined,
+  state?: { output?: Envelope; named?: Record<string, readonly Envelope[]> },
+): string | undefined {
+  const direct = primary?.meta?.runId ?? state?.output?.meta?.runId;
+  if (direct) return direct;
+  for (const outs of Object.values(state?.named ?? {})) {
+    const id = outs.at(-1)?.meta?.runId;
+    if (id) return id;
+  }
+  return undefined;
 }
 
 /**
@@ -113,7 +173,13 @@ export function deriveTracked(
   const after = edges[IMPLEMENT] ?? "stop";
   const declared = typeof after === "function" ? [...(after.targets ?? [])] : [after];
   const check: EdgeFn = Object.assign(
-    (ctx: unknown) => (takeDeviationRoute(g) === "reimplement" ? IMPLEMENT : typeof after === "function" ? after(ctx) : after),
+    (ctx: unknown) => {
+      setNote(check, undefined);
+      const c = ctx as { output?: Envelope; state?: { output?: Envelope; named?: Record<string, readonly Envelope[]> } } | undefined;
+      if (takeDeviationRoute(g, runIdFrom(c?.output, c?.state)) === "reimplement") return IMPLEMENT;
+      // implement's own edge decides, and its note (a noted stop halts the run) comes with it.
+      return typeof after === "function" ? delegate(after, check, ctx) : after;
+    },
     { targets: [...new Set([...declared, IMPLEMENT])] },
   );
   edges = { ...edges, [IMPLEMENT]: DEVIATION_CHECK, [DEVIATION_CHECK]: check };
@@ -132,10 +198,12 @@ export function deriveTracked(
 /** A side-effect script stage, the plain-object form of rpiv's `acts.script({ run })`. */
 export const scriptStage = (run: (ctx: ScriptCtx) => Promise<void>) => ({ kind: "side-effect", sessionPolicy: "fresh", run });
 
+type ArtifactsEnvelope = Envelope & { artifacts?: readonly { handle: { kind: string; path?: string } }[] };
+
 export interface ScriptCtx {
   cwd: string;
-  input?: { artifacts?: readonly { handle: { kind: string; path?: string } }[] };
-  state?: { named?: Record<string, readonly { artifacts?: readonly { handle: { kind: string; path?: string } }[] }[]> };
+  input?: ArtifactsEnvelope;
+  state?: { output?: ArtifactsEnvelope; named?: Record<string, readonly ArtifactsEnvelope[]> };
 }
 
 function registry(g: Record<symbol, unknown>): WorkflowLike[] {
@@ -222,7 +290,7 @@ async function applyGateNotes(
     // A plan gate records the plan in its reason; a deviation gate's reason is what the
     // model found, so its plan comes from the run's own channels.
     const plan = kind === "approval" ? gatePlan(gate.description) ?? findPlanPath(ctx) : findPlanPath(ctx);
-    if (!plan || plan === "the") {
+    if (!plan) {
       notify(`rpivw: your ${kind} notes for gate ${gate.id} are on ${bead}; no plan artifact to add them to.`, kind === "approval" ? "warning" : "info");
       return;
     }
@@ -234,8 +302,11 @@ async function applyGateNotes(
   }
 }
 
-/** Plan path recorded in a gate's reason: "Reason: <plan> (run <id>)". */
-export const gatePlan = (description: string | undefined) => description?.match(/Reason: (\S+)/)?.[1];
+/**
+ * Plan path recorded in a plan gate's reason: "Reason: <plan>.md (run <id>)". Undefined when
+ * the gate found no plan (older gates recorded "the plan (run …)").
+ */
+export const gatePlan = (description: string | undefined) => description?.match(/Reason: (\S+\.md) \(run /)?.[1];
 
 export const isRpivwGate = (b: Bead) => b.issue_type === "gate" && !!b.labels?.some((l) => l === GATE_LABEL || l === DEVIATION_LABEL);
 
@@ -243,11 +314,22 @@ export const isRpivwGate = (b: Bead) => b.issue_type === "gate" && !!b.labels?.s
 
 export interface GateDeps {
   beads?: Beads;
-  /** The run id handed over by onStageStart for this cwd (script stages don't get it). */
+  /**
+   * Fallback run id, handed over by onStageStart for this cwd. It's keyed by cwd, so two
+   * runs in one checkout can race; stages prefer the run id on their input envelopes.
+   */
   takeRunId(cwd: string): string | undefined;
   /** Bead and project linked to a run, via the run's name. */
   linkFor(cwd: string, runId: string): Promise<{ bead?: string; projectKey?: string }>;
   notify(msg: string, level?: "info" | "warning" | "error"): void;
+  /** "How to review" lines for a new plan gate (plannotator, file link, diff). */
+  reviewLines?(cwd: string, plan: string, gateId: string): Promise<string[]>;
+}
+
+/** This stage's run id. Always drains the cwd handoff, so a stale id can't reach a later stage. */
+function stageRunId(ctx: ScriptCtx, deps: GateDeps): string | undefined {
+  const handed = deps.takeRunId(ctx.cwd);
+  return runIdFrom(ctx.input, ctx.state) ?? handed;
 }
 
 /** What a halted run shows, and what `/work next` surfaces. */
@@ -263,7 +345,7 @@ export const deviationHint = (gateId: string) =>
  */
 export function makePlanGate(deps: GateDeps) {
   return async (ctx: ScriptCtx): Promise<void> => {
-    const runId = deps.takeRunId(ctx.cwd);
+    const runId = stageRunId(ctx, deps);
     if (!runId || !deps.beads) {
       throw new Error("plan approval: couldn't identify this run or reach beads. Start tracked runs with /work start, or use the plain workflow.");
     }
@@ -279,18 +361,19 @@ export function makePlanGate(deps: GateDeps) {
     }
     if (latest) throw new Error(awaitingPlan(latest.id));
 
-    const plan = findPlanPath(ctx) ?? "the plan";
+    const plan = findPlanPath(ctx);
+    const shown = plan ?? "(no plan artifact found)";
     const title = (await deps.beads.show(bead)).title;
     const gate = await deps.beads.createGate({
       blocks: bead,
       title: `Plan approval: ${title}`,
-      reason: `${plan} (run ${runId})`,
+      reason: `${plan ?? "no plan artifact found"} (run ${runId})`,
       awaitId: runId,
       labels: [GATE_LABEL, ...(projectKey ? [projectLabel(projectKey)] : [])],
     });
-    await deps.beads.comment(bead, `plan ready for approval: ${plan}. ${approveHint(gate.id)}`);
-    const review = (await deps.reviewLines?.(ctx.cwd, plan, gate.id).catch(() => [])) ?? [];
-    deps.notify([`rpivw: plan ready for review: ${plan}`, ...review, approveHint(gate.id)].join("\n"), "info");
+    await deps.beads.comment(bead, `plan ready for approval: ${shown}. ${approveHint(gate.id)}`);
+    const review = plan ? ((await deps.reviewLines?.(ctx.cwd, plan, gate.id).catch(() => [])) ?? []) : [];
+    deps.notify([`rpivw: plan ready for review: ${shown}`, ...review, approveHint(gate.id)].join("\n"), "info");
     throw new Error(awaitingPlan(gate.id));
   };
 }
@@ -303,9 +386,9 @@ export function makePlanGate(deps: GateDeps) {
  */
 export function makeDeviationCheck(deps: GateDeps, g: Record<symbol, unknown> = globalThis as never) {
   return async (ctx: ScriptCtx): Promise<void> => {
-    setDeviationRoute("continue", g);
-    const runId = deps.takeRunId(ctx.cwd);
-    if (!runId || !deps.beads) return;
+    const runId = stageRunId(ctx, deps);
+    if (!runId || !deps.beads) return; // no decision recorded for the run: its edge continues
+    setDeviationRoute(runId, "continue", g);
     const mine = (await deps.beads.gates()).filter((x) => x.await_id === runId && x.labels?.includes(DEVIATION_LABEL));
     const open = mine.filter((x) => x.status !== "closed");
     if (open.length) {
@@ -319,7 +402,7 @@ export function makeDeviationCheck(deps: GateDeps, g: Record<symbol, unknown> = 
         await deps.beads.comment(bead, `run ${runId}: re-running implement after deviation ${redo.id}`);
         await applyGateNotes(redo, "deviation", ctx, deps.beads, bead, deps.notify);
       }
-      setDeviationRoute("reimplement", g);
+      setDeviationRoute(runId, "reimplement", g);
     }
   };
 }

@@ -9,7 +9,8 @@
     "extensions": ["./index.ts"]
   },
   "scripts": {
-    "test": "node --test test/"
+    "test": "node --test test/",
+    "typecheck": "node scripts/typecheck.mjs"
   },
   "engines": {
     "node": "^22.18.0 || >=23.6.0"

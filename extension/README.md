@@ -129,7 +129,8 @@ Verified on rpiv-workflow 2.12's real runner: implement → deviation-check (sto
 
 - `/work new` creates a bead in the store's single beads database, labeled `project:<key>`,
   with your brief verbatim as its description.
-- `/work start <bead>` claims the bead and sends `/wf <workflow> <brief> --name <bead>--r<n>`
+- `/work start <bead>` sends `/wf <workflow> <brief> --name <bead>--r<n>` (the bead is claimed
+  when the run starts, so a `/wf` that refuses the command leaves the bead untouched)
   through Pi's normal command path, so the run gets its usual detached lane. rpiv records the
   name in the run's JSONL header, and the listener reads it back to find the bead. A `/wf` you
   start by hand with a name in that format is linked the same way, and so are resumes.
@@ -169,7 +170,7 @@ rpiv-workflow 2.11 and 2.12; startup warns on other versions.
 | --- | --- |
 | `/work new "<brief>" [--type feature\|bug\|task\|chore\|epic] [--parent <bead>]` | Create a bead for this project |
 | `/work next [--all]` | In-progress and ready beads for this project (or every project). Epics are listed separately. |
-| `/work start <bead> [ship\|build\|<workflow>] [--force]` | Claim the bead and start the linked `/wf` run. Refuses beads from other projects, in-progress beads (resume with `/wf @<run>`), epics, and closed beads unless `--force`. |
+| `/work start <bead> [ship\|build\|<workflow>] [--force]` | Start the linked `/wf` run (it claims the bead when it starts). Refuses beads from other projects, in-progress beads (resume with `/wf @<run>`), epics, and closed beads unless `--force`. |
 | `/work status [<bead>]` | No bead: store, project, mount, and in-progress beads. With a bead: phase, runs, artifacts, recent notes. |
 | `/work review [<gate>]` | Open the plan a gate is holding: plannotator when installed, a `file://` link, and a `hunk diff` of its changes. |
 | `/work approve <gate> [notes] [--reimplement]` | Approve the plan (or decide a deviation) and resume its run. Your notes go on the bead and into the plan implement reads. On a deviation gate, `--reimplement` sends the run back to implement once. |
@@ -226,7 +227,13 @@ database (`bd init --stealth --prefix rw`) when `bd` is available. It works with
 ```bash
 cd extension
 node --test test/        # Node 22.18+ / 23.6+ runs the .ts files directly
+npm run typecheck        # tsc --noEmit against the installed Pi's types
 ```
+
+`npm run typecheck` (`scripts/typecheck.mjs`) finds Pi's install (`$PI_NODE_MODULES`, else
+the managed install under the agent folder, else the `pi` on PATH), maps the Pi and typebox
+imports to their type entry points in a throwaway tsconfig, and runs the `tsc` on PATH (else
+`npx -p typescript tsc`). It covers `index.ts`, `src/`, and `test/`, with `erasableSyntaxOnly`.
 
 No build step and no dependencies. Keep the code to *erasable* TypeScript (no enums,
 namespaces, or parameter properties) so Node's type stripping and Pi's jiti both load it.

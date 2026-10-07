@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { gitOut } from "../src/exec.ts";
-import { defaultName, readRegistry, register, writeRegistry } from "../src/registry.ts";
+import { defaultName, readRegistry, type Registry, register, writeRegistry } from "../src/registry.ts";
 import { generateKey, gitInit, keyFromRemote, pinKey, repoInfo, repoState, unsafeRepoDir } from "../src/repo.ts";
 
 test("keyFromRemote normalizes common URL shapes", () => {
@@ -30,7 +30,7 @@ test("defaultName takes the last key segment, or the folder for local keys", () 
 });
 
 test("register adds projects and new checkout paths idempotently", () => {
-  const reg = { version: 1 as const, projects: {} };
+  const reg: Registry = { version: 1, projects: {} };
   assert.equal(register(reg, "k", "dash", "/a"), true);
   assert.equal(register(reg, "k", "dash", "/a"), false);
   assert.equal(register(reg, "k", "dash", "/b"), true);

@@ -46,6 +46,47 @@ test("readRunHeader reads the JSONL header's name", () => {
   }
 });
 
+// ---------------------------------------------------------------- bd queue (fake bd)
+
+test("bd calls share one queue per store across instances; patchRpiv loses no update", async () => {
+  // A slow fake bd holding one bead's metadata. Child sessions open their own Beads in the
+  // same process, so two instances over one store must still run bd one call at a time.
+  let meta: Record<string, unknown> = {};
+  let running = 0;
+  let maxRunning = 0;
+  const runner = async (_cmd: string, args: string[]) => {
+    running++;
+    maxRunning = Math.max(maxRunning, running);
+    await new Promise((r) => setTimeout(r, 5));
+    running--;
+    if (args[0] === "show") return { code: 0, stdout: JSON.stringify({ id: "rw-1", title: "t", status: "open", issue_type: "task", metadata: meta }), stderr: "" };
+    if (args[0] === "update") {
+      meta = { ...meta, ...JSON.parse(args[args.indexOf("--metadata") + 1]) };
+      return { code: 0, stdout: "{}", stderr: "" };
+    }
+    return { code: 0, stdout: "[]", stderr: "" };
+  };
+  const g: Record<symbol, unknown> = {};
+  const launcher = openBeads("/store", runner, "bd", g);
+  const child = openBeads("/store", runner, "bd", g);
+  const other = openBeads("/elsewhere", runner, "bd", g);
+
+  const buckets = ["plans", "designs", "reviews", "verdicts"];
+  await Promise.all([
+    ...buckets.map((k, i) =>
+      (i % 2 ? child : launcher).patchRpiv("rw-1", (m) => ({ ...m, artifacts: { ...m.artifacts, [k]: `${k}/x.md` } })),
+    ),
+    launcher.list(),
+    child.gates(),
+  ]);
+  assert.equal(maxRunning, 1, "no two bd calls for one store overlap");
+  assert.deepEqual(Object.keys(rpivMeta({ metadata: meta } as Bead).artifacts ?? {}).sort(), [...buckets].sort(), "every patch survived");
+
+  maxRunning = 0;
+  await Promise.all([launcher.list(), other.list()]);
+  assert.equal(maxRunning, 2, "different stores don't wait on each other");
+});
+
 // ---------------------------------------------------------------- bd wrapper (real bd)
 
 const hasBd = (() => {
@@ -128,6 +169,7 @@ function fakeBeads() {
     createGate: async () => ({}) as Bead,
     gates: async () => [],
     resolveGate: async () => {},
+    updateLabels: async () => {},
   };
   return { beads, calls, meta };
 }
@@ -195,7 +237,7 @@ test("a stopped run comments on the bead instead of closing it; unnamed runs lea
     writeFileSync(join(runs, "plain.jsonl"), `${JSON.stringify({ runId: "plain", workflow: "ship", input: "x" })}\n`);
     const fb = fakeBeads();
     const l = createListeners({
-      store: { root: store, commit: async () => null, push: async () => ({ ok: true, detail: "" }) },
+      store: { root: store, commit: async () => null, push: async () => ({ ok: true, detail: "" }), showHead: async () => undefined },
       resolve: async () => ({ key: "k", root: checkout, artifacts: join(store, "projects", "k", "artifacts") }),
       pushOnEnd: () => false,
       notify: () => {},

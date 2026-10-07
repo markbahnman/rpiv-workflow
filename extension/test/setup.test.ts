@@ -52,7 +52,7 @@ test("setup with bd: new store, idempotent rerun, then a second machine joins ov
   // bd and dolt keep per-user state under HOME; keep the test away from the real one.
   const home = join(dir, "home");
   mkdirSync(home);
-  const isolated: typeof run = (cmd, args, o) =>
+  const isolated: typeof run = (cmd, args, o = {}) =>
     run(cmd, args, { ...o, env: { ...(o.env ?? process.env), HOME: home, USERPROFILE: home, XDG_CONFIG_HOME: join(home, ".config") } });
   try {
     const remote = join(dir, "r.git");

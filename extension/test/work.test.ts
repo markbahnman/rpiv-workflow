@@ -61,6 +61,7 @@ function world(initial: Bead[] = []) {
       calls.push(`resolve ${id}`);
       beads.get(id)!.status = "closed";
     },
+    updateLabels: async () => {},
   };
   return { api, beads, calls };
 }
@@ -111,7 +112,7 @@ test("/work next shows this project's work, with --all across projects", async (
   assert.match(all, /site {2}rw-b {2}bug {2}Site thing/);
 });
 
-test("/work start claims the bead and builds a named /wf command", async () => {
+test("/work start builds a named /wf command and leaves the claim to the run", async () => {
   const w = world([
     { id: "rw-5b3.1", title: "Repin iced", description: "Repin iced\n  to the master tip", status: "open", issue_type: "chore", labels: [P] },
   ]);
@@ -119,8 +120,10 @@ test("/work start claims the bead and builds a named /wf command", async () => {
   assert.equal(plan.runName, "rw-5b3_1--r2");
   assert.equal(plan.workflow, "ship-rpivw");
   assert.equal(plan.command, "/wf ship-rpivw Repin iced to the master tip --name rw-5b3_1--r2");
-  assert.deepEqual(w.calls, ["claim rw-5b3.1"]);
-  // The first start claimed it; a second plain start is refused with a resume hint.
+  assert.deepEqual(w.calls, [], "not claimed yet: a /wf that never starts mustn't strand the bead in progress");
+  assert.equal(w.beads.get("rw-5b3.1")!.status, "open");
+  // Once the run has started (onWorkflowStart claims it), a second plain start is refused with a resume hint.
+  await w.api.claim("rw-5b3.1");
   w.beads.get("rw-5b3.1")!.metadata = { rpiv: { runs: ["2026-10-04_09-00-00-aaaa"] } };
   await assert.rejects(workStart(ctxFor(w.api), "rw-5b3.1 build", {}), /already in progress\. Resume its run with \/wf @2026-10-04_09-00-00-aaaa/);
   const build = await workStart(ctxFor(w.api), "rw-5b3.1 build --force", {});
@@ -139,7 +142,7 @@ test("/work start refuses other projects, epics, and closed beads unless forced"
   await assert.rejects(workStart(c, "rw-e", {}), /is an epic/);
   await assert.rejects(workStart(c, "rw-z", {}), /is closed/);
   await assert.rejects(workStart(c, "", {}), /usage/);
-  assert.equal(w.calls.length, 0, "nothing claimed on refusal");
+  assert.equal(w.calls.length, 0, "nothing written on refusal");
   assert.ok((await workStart(c, "rw-x --force", {})).command.includes("--name rw-x--r1"));
   assert.match((await workStart(c, "rw-at", {})).command, /^\/wf ship-rpivw Task: @2026/);
 });

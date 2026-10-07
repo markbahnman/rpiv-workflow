@@ -120,8 +120,10 @@ export interface StartPlan {
 }
 
 /**
- * /work start <bead> [workflow] [--force] — claim the bead and build the /wf command.
- * The caller sends `command`; the lifecycle bridge links the run back via its name.
+ * /work start <bead> [workflow] [--force] — check the bead and build the /wf command.
+ * The caller sends `command`; the lifecycle bridge links the run back via its name and
+ * claims the bead when the run actually starts (onWorkflowStart). Claiming here would
+ * leave the bead in progress with no run if /wf refused the command.
  */
 export async function workStart(ctx: WorkCtx, args: string, takenRunNames: Record<string, string>): Promise<StartPlan> {
   const project = needProject(ctx);
@@ -148,7 +150,6 @@ export async function workStart(ctx: WorkCtx, args: string, takenRunNames: Recor
   let input = (bead.description || bead.title).replace(/\s+/g, " ").trim();
   if (input.startsWith("@")) input = `Task: ${input}`; // "@..." would mean "resume" to /wf
   const runName = nextRunName(bead.id, takenRunNames);
-  await ctx.beads.claim(bead.id);
   return { bead, workflow, runName, command: `/wf ${workflow} ${input} --name ${runName}` };
 }
 
@@ -194,8 +195,9 @@ export const gateHint = (g: Bead) => (isDeviationGate(g) ? deviationHint(g.id) :
  * in most terminals) and a file:// link. M5 adds a link to the rendered plan.
  */
 function gatePlanLines(g: Bead, ctx: WorkCtx): string[] {
-  const plan = gatePlan(g.description);
-  if (!plan || plan === "the") return [];
+  // A deviation gate's reason is what the model found, not a plan path.
+  const plan = isDeviationGate(g) ? undefined : gatePlan(g.description);
+  if (!plan) return [];
   const abs = isAbsolute(plan) ? plan : ctx.root ? resolve(ctx.root, plan) : undefined;
   return [`      plan: ${plan}`, ...(abs ? [`      open: ${pathToFileURL(abs).href}`] : [])];
 }
@@ -229,12 +231,14 @@ export interface ApproveResult {
  * sends the run back to implement once (after you've revised the plan).
  */
 export async function workApprove(ctx: WorkCtx, args: string): Promise<ApproveResult> {
-  const { flags, rest } = parseArgs(args);
-  const [id, ...words] = rest.split(/\s+/).filter(Boolean);
+  // Only --reimplement is a flag here. The notes stay as typed: other `--words` are part
+  // of what the driver wrote (they reach implement verbatim), so parseArgs can't be used.
+  const reimplement = /(^|\s)--reimplement(?=\s|$)/.test(args);
+  const text = args.replace(/(^|\s+)--reimplement(?=\s|$)\s*/g, " ").trim();
+  const id = text.match(/^\S+/)?.[0];
+  const notes = id ? text.slice(id.length).trim() : "";
   const g = await openGate(ctx, id, "usage: /work approve <gate> [notes] [--reimplement]");
-  const notes = words.join(" ").trim();
   const bead = gateBlocks(g.description);
-  const reimplement = flags.reimplement === true;
   let what: string;
   if (isDeviationGate(g)) {
     if (reimplement) await ctx.beads.updateLabels(g.id, [REIMPLEMENT_LABEL], []);

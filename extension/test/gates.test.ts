@@ -27,7 +27,9 @@ import { applyPlanReview, type WorkCtx, workApprove, workNext, workReject, workS
 
 // ---------------------------------------------------------------- workflow derivation
 
-const route = (targets: string[], fn: (ctx: { pass: boolean }) => string) => Object.assign(fn, { targets, readsData: false });
+// rpiv hands edges an untyped ctx; these fakes read only `pass`.
+const route = (targets: string[], fn: (ctx: { pass: boolean }) => string) =>
+  Object.assign((ctx: unknown) => fn(ctx as { pass: boolean }), { targets, readsData: false });
 
 function buildLike(): WorkflowLike {
   return {
@@ -61,11 +63,14 @@ test("deriveTracked adds plan-approval before implement and deviation-check afte
   assert.equal(cite.readsData, false, "route metadata preserved");
 
   const check = t.edges[DEVIATION_CHECK] as ((c: unknown) => string) & { targets: string[] };
+  const edgeCtx = (runId: string) => ({ output: { meta: { runId } }, state: { named: {} } });
   assert.deepEqual(check.targets, ["scope-check", "implement"]);
-  assert.equal(check({}), "scope-check", "default: continue to implement's original next stage");
-  setDeviationRoute("reimplement", g);
-  assert.equal(check({}), "implement", "a reimplement decision routes back once");
-  assert.equal(check({}), "scope-check", "the decision is consumed");
+  assert.equal(check(edgeCtx("run-1")), "scope-check", "default: continue to implement's original next stage");
+  setDeviationRoute("run-1", "reimplement", g);
+  assert.equal(check(edgeCtx("run-2")), "scope-check", "another run's edge doesn't see run-1's decision");
+  assert.equal(check({}), "scope-check", "an edge that can't tell its run continues");
+  assert.equal(check(edgeCtx("run-1")), "implement", "a reimplement decision routes back once");
+  assert.equal(check(edgeCtx("run-1")), "scope-check", "the decision is consumed");
 
   assert.equal(base.edges["code-grade"], "implement", "base workflow not mutated");
   assert.equal(deriveTracked({ ...base, stages: { goal: {} } }, { deviationCheck: {} }), undefined, "no implement stage → no variant");
@@ -86,6 +91,73 @@ test("without a plan gate only deviation-check is added; function edges out of i
   const check = t.edges[DEVIATION_CHECK] as ((c: { pass: boolean }) => string) & { targets: string[] };
   assert.deepEqual(check.targets, ["validate", "fix", "implement"]);
   assert.equal(check({ pass: false }), "fix", "original routing function still decides");
+});
+
+// rpiv-workflow routing-dsl.ts: setRouteNote / takeRouteNote use this symbol on the edge function.
+const ROUTE_NOTE = Symbol.for("rpiv.workflow.routeNote");
+type Noted = ((c: unknown) => string) & { targets?: string[]; [ROUTE_NOTE]?: string };
+const setRouteNote = (fn: Noted, note: string) => void (fn[ROUTE_NOTE] = note);
+const takeRouteNote = (fn: Noted) => {
+  const n = fn[ROUTE_NOTE];
+  fn[ROUTE_NOTE] = undefined;
+  return n;
+};
+
+test("route notes survive derivation: a noted stop still halts build-rpivw", () => {
+  // Shaped like rpiv-pi's build: code-demote can reach implement and notes some picks;
+  // validate can't reach implement and notes its stops (a noted stop = blocked gate, not success).
+  let demote: "implement" | "code-snapshot" = "code-snapshot";
+  const codeDemote: Noted = Object.assign(
+    () => {
+      if (demote === "code-snapshot") setRouteNote(codeDemote, "unit failed: correctness");
+      return demote;
+    },
+    { targets: ["implement", "code-snapshot"] },
+  );
+  let validateFails = true;
+  const validate: Noted = Object.assign(
+    () => {
+      if (!validateFails) return "commit";
+      setRouteNote(validate, "validate failed with no remediable handle");
+      return "stop";
+    },
+    { targets: ["commit", "stop"] },
+  );
+  const implementNext: Noted = Object.assign(
+    () => {
+      setRouteNote(implementNext, "integrity stop");
+      return "stop";
+    },
+    { targets: ["validate", "stop"] },
+  );
+  setRouteNote(codeDemote, "stale note from an earlier run");
+  const base: WorkflowLike = {
+    name: "build",
+    start: "plan",
+    stages: { plan: {}, "code-demote": {}, "code-snapshot": {}, implement: {}, validate: {}, commit: {} },
+    edges: { plan: "code-demote", "code-demote": codeDemote, "code-snapshot": "code-demote", implement: implementNext, validate, commit: "stop" },
+  };
+  const t = deriveTracked(base, { planGate: {}, deviationCheck: {} }, {})!;
+
+  assert.equal(t.edges.validate, validate, "edges that can't reach implement aren't wrapped");
+  assert.equal(validate({}), "stop");
+  assert.equal(takeRouteNote(t.edges.validate as Noted), "validate failed with no remediable handle");
+
+  const wrapped = t.edges["code-demote"] as Noted;
+  assert.notEqual(wrapped, codeDemote);
+  assert.equal(takeRouteNote(wrapped), undefined, "a note on the original at derive time isn't copied");
+  assert.equal(wrapped({}), "code-snapshot");
+  assert.equal(takeRouteNote(wrapped), "unit failed: correctness", "the runner finds the pick's note on the edge it holds");
+  assert.equal(takeRouteNote(codeDemote), undefined, "and none is left behind on rpiv's original");
+  demote = "implement";
+  assert.equal(wrapped({}), PLAN_GATE);
+  assert.equal(takeRouteNote(wrapped), undefined, "a noteless pick carries no note");
+
+  const check = t.edges[DEVIATION_CHECK] as Noted;
+  assert.equal(check({}), "stop");
+  assert.equal(takeRouteNote(check), "integrity stop", "deviation-check hands on implement's own edge's note");
+  assert.equal(takeRouteNote(implementNext), undefined);
+  validateFails = false;
 });
 
 test("installTrackedWorkflows derives now if the base exists, else waits via a provider", async () => {
@@ -227,6 +299,64 @@ test("plan gate: halts with a new gate, halts again while open, passes once appr
   await assert.rejects(gate(ctx), /couldn't identify this run/, "fails closed");
 });
 
+test("gate stages take the run id from their input envelopes before the cwd handoff", async () => {
+  // Two runs in one checkout: the cwd handoff can hold the other run's id.
+  const w = world();
+  const taken: string[] = [];
+  const linked: string[] = [];
+  const deps = {
+    beads: w.api,
+    takeRunId: (cwd: string) => (taken.push(cwd), "run-other"),
+    linkFor: async (_cwd: string, runId: string) => (linked.push(runId), { bead: "rw-5b3", projectKey: "k" }),
+    notify: () => {},
+  };
+  const plan = ".rpiv/artifacts/plans/p.md";
+  const envelope = { meta: { runId: "run-1" }, artifacts: [{ handle: { kind: "fs", path: plan } }] };
+  await assert.rejects(makePlanGate(deps)({ cwd: "/co", input: envelope }), /waiting for plan approval/);
+  assert.equal(w.beads.get("rw-g1")!.await_id, "run-1");
+  assert.deepEqual(linked, ["run-1"]);
+  assert.deepEqual(taken, ["/co"], "the handoff is still drained");
+
+  // deviation-check: the input may be a non-producing stage's; the named channels still carry the id.
+  const g: Record<symbol, unknown> = {};
+  await recordDeviation({ severity: "major", found: "f", impact: "i", proposal: "revise" }, devDeps(w.api, []));
+  await assert.rejects(
+    makeDeviationCheck(deps, g)({ cwd: "/co", state: { named: { plans: [envelope] } } }),
+    /major deviation awaiting your decision: \/work approve rw-g2/,
+  );
+});
+
+test("a plan gate with no plan artifact says so, and nothing treats the wording as a path", async () => {
+  const w = world();
+  const gate = makePlanGate({ beads: w.api, takeRunId: () => "run-1", linkFor: async () => ({ bead: "rw-5b3", projectKey: "k" }), notify: () => {} });
+  await assert.rejects(gate({ cwd: "/co" }), /waiting for plan approval \(gate rw-g1\)/);
+  assert.match(w.beads.get("rw-g1")!.description!, /Reason: no plan artifact found \(run run-1\)/);
+  assert.equal(gatePlan(w.beads.get("rw-g1")!.description), undefined);
+  assert.ok(w.calls.some((c) => c.startsWith("comment rw-5b3: plan ready for approval: (no plan artifact found).")));
+  assert.equal(gatePlan("Ad-hoc gate blocking rw-1\n\nReason: the plan (run r1)"), undefined, "the old placeholder isn't a path");
+
+  const rej = await workReject(wctx(w.api), "rw-g1 split it");
+  assert.equal(rej.revise, undefined, "no /skill:revise without a plan");
+  assert.match(rej.message, /revise the plan, then \/work approve rw-g1/);
+  assert.doesNotMatch(await workNext(wctx(w.api), ""), /plan:/);
+});
+
+test("a deviation gate's reason is never shown as its plan", async () => {
+  const w = world();
+  await recordDeviation({ severity: "major", found: "docs/api.md", impact: "i", proposal: "revise" }, devDeps(w.api, []));
+  assert.doesNotMatch(await workNext({ ...wctx(w.api), root: "/co" }, ""), /plan:/);
+});
+
+test("/work approve keeps the notes as typed; only --reimplement is a flag", async () => {
+  const w = world();
+  await recordDeviation({ severity: "major", found: "f", impact: "i", proposal: "revise" }, devDeps(w.api, []));
+  await workApprove(wctx(w.api), "rw-g1 keep --dry-run as the default,  then --reimplement   phase 3");
+  const a = (w.beads.get("rw-5b3")!.metadata!.rpiv as RpivMeta).approvals!["rw-g1"];
+  assert.equal(a.notes, "keep --dry-run as the default,  then phase 3");
+  assert.equal(w.beads.get("rw-g1")!.status, "closed");
+  assert.ok(w.beads.get("rw-g1")!.labels!.includes(REIMPLEMENT_LABEL));
+});
+
 test("plan gate fails closed for runs not linked to a bead", async () => {
   const w = world();
   const gate = makePlanGate({ beads: w.api, takeRunId: () => "run-x", linkFor: async () => ({}), notify: () => {} });
@@ -301,7 +431,7 @@ test("deviation-check halts while a major deviation is open; approve continues, 
   const g: Record<symbol, unknown> = {};
   const routeAfter = () => {
     const t = deriveTracked(buildLike(), { deviationCheck: {} }, g)!;
-    return (t.edges[DEVIATION_CHECK] as (c: unknown) => string)({});
+    return (t.edges[DEVIATION_CHECK] as (c: unknown) => string)({ output: { meta: { runId: "run-1" } } });
   };
   const check = makeDeviationCheck({ beads: w.api, takeRunId: () => "run-1", linkFor: async () => ({ bead: "rw-5b3" }), notify: () => {} }, g);
 

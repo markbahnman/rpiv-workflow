@@ -30,6 +30,7 @@ import { generateKey, gitInit, KEY_CONFIG, pinKey, type RepoInfo, repoInfo, repo
 import { beadFromRunName, childRunId, readRunHeader, readRunNames, runsDir } from "./src/runs.ts";
 import {
   DEVIATION_CHECK,
+  deviationHint,
   type GateDeps,
   gatePlan,
   installTrackedWorkflows,
@@ -41,7 +42,7 @@ import {
 } from "./src/gates.ts";
 import { recordDeviation } from "./src/deviation.ts";
 import { Type } from "typebox";
-import { absPlan, detectReviewTools, planDiffCommand, requestPlanGateReview, reviewLines, storePlanPath } from "./src/review.ts";
+import { absPlan, detectReviewTools, planDiffCommand, plannotatorListening, requestPlanGateReview, reviewLines, storePlanPath } from "./src/review.ts";
 import { setupStore } from "./src/setup.ts";
 import { formatStopReport, latestStoppedRun, stopReport } from "./src/stopreport.ts";
 import { openStore } from "./src/store.ts";
@@ -323,8 +324,8 @@ export default function rpivw(pi: ExtensionAPI) {
         beads,
       }),
     );
-    // Script stages don't receive the run id; onStageStart fires right before a
-    // script stage's run(), so hand the id over for our gate stages.
+    // Fallback run id for our gate stages, which normally read it from their input
+    // envelopes: onStageStart fires right before a script stage's run().
     const disposeGate = registerLifecycle({
       onStageStart: (stage, lctx) => {
         if (stage.name === PLAN_GATE || stage.name === DEVIATION_CHECK) gateRuns.set(lctx.cwd, lctx.runId);
@@ -506,14 +507,18 @@ export default function rpivw(pi: ExtensionAPI) {
               gate = waiting[0];
               if (!gate) throw new Error("no plan is waiting for approval in this project.");
             }
+            if (isDeviationGate(gate)) throw new Error(`${gate.id} is a deviation, not a plan. Decide it with ${deviationHint(gate.id)}`);
             const plan = gatePlan(gate.description);
-            if (!plan || plan === "the") throw new Error(`${gate.id} doesn't record a plan path.`);
+            if (!plan) throw new Error(`${gate.id} doesn't record a plan path.`);
             const r = await planReview(info.root, info.key, plan, gate.id);
             if (!existsSync(r.abs)) throw new Error(`plan not found: ${r.abs}`);
             const others = r.lines.filter((l) => !l.startsWith("review:"));
             const decide = `/work approve ${gate.id} [notes]  ·  /work reject ${gate.id} <notes>`;
-            if (!r.tools.plannotator) {
-              say([`rpivw: plan for ${gate.id}: ${plan}`, ...others, `then: ${decide}`].join("\n"));
+            // Settings say plannotator is installed; check it's loaded before handing it the plan.
+            const listening = r.tools.plannotator && (await plannotatorListening(pi.events));
+            if (!listening) {
+              const why = r.tools.plannotator ? ["plannotator is in Pi's settings but isn't responding (disabled, or it failed to load)."] : [];
+              say([`rpivw: plan for ${gate.id}: ${plan}`, ...why, ...others, `then: ${decide}`].join("\n"), why.length ? "warning" : "info");
               return;
             }
             say(
@@ -559,7 +564,8 @@ export default function rpivw(pi: ExtensionAPI) {
             }
           } else {
             const plan = await workStart(wctx, restArgs, info ? readRunNames(info.root) : {});
-            say(`rpivw: claimed ${plan.bead.id}; starting ${plan.workflow} as run "${plan.runName}"`);
+            // The bead is claimed when the run starts (onWorkflowStart), not here.
+            say(`rpivw: starting ${plan.workflow} for ${plan.bead.id} as run "${plan.runName}"`);
             // Runs /wf through Pi's normal command path, so the run gets its usual detached lane.
             pi.sendUserMessage(plan.command, { expandPromptTemplates: true });
           }

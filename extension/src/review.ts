@@ -93,6 +93,28 @@ export interface PlannotatorAnnotation {
   approved?: boolean;
 }
 
+/**
+ * Whether plannotator is listening on the event bus. Being in settings.json isn't enough
+ * (it can be disabled or fail to load), and an `annotate` request only answers once the
+ * reviewer decides, so with no listener it would wait forever. A `review-status` request
+ * is answered right away by a loaded plannotator, before it awaits anything; any answer
+ * (even "error") means it's there.
+ */
+export function plannotatorListening(events: { emit(channel: string, data: unknown): void }, timeoutMs = 1000): Promise<boolean> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => resolve(false), timeoutMs);
+    events.emit(PLANNOTATOR_REQUEST, {
+      requestId: `rpivw-probe-${Date.now().toString(36)}`,
+      action: "review-status",
+      payload: { reviewId: "rpivw-probe" },
+      respond: () => {
+        clearTimeout(timer);
+        resolve(true);
+      },
+    });
+  });
+}
+
 /** Open `filePath` in plannotator's review-gate UI. Resolves when the reviewer decides (or plannotator refuses). */
 export function requestPlanGateReview(
   events: { emit(channel: string, data: unknown): void },

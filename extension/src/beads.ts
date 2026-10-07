@@ -4,11 +4,30 @@
 //  - parse stdout only; bd prints warnings on stderr that would corrupt JSON
 //  - every bead and gate we create gets the project:<key> label explicitly
 //    (children and gates do not inherit labels)
-//  - one writer at a time: embedded Dolt is single-writer, so calls are queued
+//  - one writer at a time: embedded Dolt is single-writer, so calls are queued. The
+//    queue lives on globalThis, per store: rpiv stage child sessions load their own copy
+//    of this extension in the same process, and their bd calls must wait in the same line.
 
 import { join } from "node:path";
 import { bdPath } from "./bin.ts";
 import { type ExecResult, run as defaultRun } from "./exec.ts";
+import { pathKey } from "./paths.ts";
+
+const QUEUES = Symbol.for("rpivw:bd-queues");
+
+/** The process-wide bd queue for one store: `enqueue(fn)` runs `fn` after every job queued before it. */
+function sharedQueue(storeRoot: string, g: Record<symbol, unknown>) {
+  const queues = (g[QUEUES] ??= new Map<string, { tail: Promise<unknown> }>()) as Map<string, { tail: Promise<unknown> }>;
+  const key = pathKey(storeRoot);
+  let q = queues.get(key);
+  if (!q) queues.set(key, (q = { tail: Promise.resolve() }));
+  const slot = q;
+  return <T>(fn: () => Promise<T>): Promise<T> => {
+    const p = slot.tail.then(fn, fn);
+    slot.tail = p.catch(() => undefined);
+    return p;
+  };
+}
 
 export interface Bead {
   id: string;
@@ -65,7 +84,10 @@ export interface Beads {
   ready(p?: { labels?: string[] }): Promise<Bead[]>;
   list(p?: { labels?: string[]; status?: string }): Promise<Bead[]>;
   claim(id: string): Promise<void>;
-  /** Read-modify-write metadata.rpiv (bd merges only top-level metadata keys). */
+  /**
+   * Read-modify-write metadata.rpiv (bd merges only top-level metadata keys) as one queued
+   * job. `patch` must be pure: a bd call from inside it would wait on itself.
+   */
   patchRpiv(id: string, patch: (m: RpivMeta) => RpivMeta): Promise<RpivMeta>;
   comment(id: string, text: string): Promise<void>;
   comments(id: string): Promise<BeadComment[]>;
@@ -78,44 +100,45 @@ export interface Beads {
   updateLabels(id: string, add: string[], remove: string[]): Promise<void>;
 }
 
-/** `bin` defaults to the resolved bd path (src/bin.ts), looked up on first use. */
-export function openBeads(storeRoot: string, runner: Runner = defaultRun, bin?: string): Beads {
+/**
+ * `bin` defaults to the resolved bd path (src/bin.ts), looked up on first use. `g` holds
+ * the shared queue (tests pass their own).
+ */
+export function openBeads(storeRoot: string, runner: Runner = defaultRun, bin?: string, g: Record<symbol, unknown> = globalThis as never): Beads {
   const env = { ...process.env, BEADS_DIR: join(storeRoot, ".beads") };
-  let queue: Promise<unknown> = Promise.resolve();
-  const enqueue = <T>(fn: () => Promise<T>): Promise<T> => {
-    const p = queue.then(fn, fn);
-    queue = p.catch(() => undefined);
-    return p;
+  const enqueue = sharedQueue(storeRoot, g);
+
+  /** One bd call, unqueued: only for use inside an enqueued job. */
+  const exec = async (args: string[]) => {
+    const r = await runner(bin ?? bdPath(), args, { cwd: storeRoot, env, timeoutMs: 120_000 });
+    if (r.code !== 0) {
+      const msg = (r.stderr || r.stdout).trim().split("\n").filter((l) => !/beads\.role|Fix:|Or:/.test(l)).pop();
+      throw new Error(`bd ${args[0]} failed: ${msg ?? `exit ${r.code}`}`);
+    }
+    return r.stdout;
   };
-
-  const raw = (args: string[]) =>
-    enqueue(async () => {
-      const r = await runner(bin ?? bdPath(), args, { cwd: storeRoot, env, timeoutMs: 120_000 });
-      if (r.code !== 0) {
-        const msg = (r.stderr || r.stdout).trim().split("\n").filter((l) => !/beads\.role|Fix:|Or:/.test(l)).pop();
-        throw new Error(`bd ${args[0]} failed: ${msg ?? `exit ${r.code}`}`);
-      }
-      return r.stdout;
-    });
-
-  const json = async <T>(args: string[]): Promise<T> => {
-    const out = await raw([...args, "--json"]);
+  const parse = <T>(args: string[], out: string): T => {
     try {
       return JSON.parse(out) as T;
     } catch {
       throw new Error(`bd ${args[0]}: unexpected output: ${out.slice(0, 200)}`);
     }
   };
+  const execJson = async <T>(args: string[]): Promise<T> => parse<T>(args, await exec([...args, "--json"]));
+
+  const raw = (args: string[]) => enqueue(() => exec(args));
+  const json = <T>(args: string[]): Promise<T> => enqueue(() => execJson<T>(args));
   /** bd prints `null` instead of `[]` for some empty lists (`gate list` with no gates). */
   const many = async <T>(args: string[]): Promise<T[]> => (await json<T[] | null>(args)) ?? [];
   const one = (v: Bead | Bead[]) => (Array.isArray(v) ? v[0] : v);
   const labelArgs = (labels?: string[]) => (labels ?? []).flatMap((l) => ["-l", l]);
 
-  const show = async (id: string) => {
-    const b = one(await json<Bead | Bead[]>(["show", id]));
+  const showWith = async (call: <T>(args: string[]) => Promise<T>, id: string) => {
+    const b = one(await call<Bead | Bead[]>(["show", id]));
     if (!b) throw new Error(`bead ${id} not found`);
     return b;
   };
+  const show = (id: string) => showWith(json, id);
 
   return {
     create: async (p) =>
@@ -136,12 +159,14 @@ export function openBeads(storeRoot: string, runner: Runner = defaultRun, bin?: 
     claim: async (id) => {
       await json(["update", id, "--claim"]);
     },
-    patchRpiv: async (id, patch) => {
-      const current = await show(id);
-      const next = patch({ ...rpivMeta(current) });
-      await json(["update", id, "--metadata", JSON.stringify({ rpiv: next })]);
-      return next;
-    },
+    // One job, so no other bd write can land between the read and the write.
+    patchRpiv: (id, patch) =>
+      enqueue(async () => {
+        const current = await showWith(execJson, id);
+        const next = patch({ ...rpivMeta(current) });
+        await execJson(["update", id, "--metadata", JSON.stringify({ rpiv: next })]);
+        return next;
+      }),
     comment: async (id, text) => {
       await raw(["comments", "add", id, text]);
     },

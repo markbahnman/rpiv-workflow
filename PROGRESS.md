@@ -24,6 +24,37 @@ Phases 2 and 3 interleave: M0–M2 have to exist before the mocks can run for re
 
 ## Done
 
+- 2026-10-07: **Code review fixes.** A whole-extension review (checked against rpiv-* 2.12.0)
+  found a blocker, five concerns, and two smaller issues; all are fixed. 89 tests.
+  - Gate stages read the run id from their input envelopes (`OutputMeta.runId`) instead of a
+    per-cwd handoff. The deviation route slot is keyed by run, so concurrent tracked runs can't
+    take each other's ids or "reimplement" decisions.
+  - bd calls share one queue per store on `globalThis`. Stage child sessions open their own
+    `Beads` in the same process, so the old per-instance queues ran bd concurrently.
+    `patchRpiv` now does its read-modify-write as one queued job, so concurrent loop units can't
+    lose each other's updates.
+  - A plan gate with no plan says "no plan artifact found", and `gatePlan` only matches `.md`
+    paths. Before this, `/work reject` could send `/skill:revise the <notes>`.
+  - `/work start` no longer claims the bead; the run claims it when it starts. Before this, a
+    refused `/wf` left the bead in progress with no run.
+  - `/work review` checks that plannotator is loaded (a `review-status` probe) before it hands
+    the plan over, so it can no longer wait forever when plannotator isn't loaded.
+  - `/work approve` keeps the notes as typed: only `--reimplement` counts as a flag.
+  - New `npm run typecheck` (tsc --noEmit against the installed Pi's types). It found the
+    missing `GateDeps.reviewLines` field and some incomplete test fakes.
+  - **Blocker, fixed:** `routeThrough` used to wrap every function edge of `build-rpivw`, and
+    the wrapper hid the route notes that rpiv's original edges set at runtime. rpiv treats a
+    `stop` that carries a note as a blocked gate and halts the run; without the note it finishes
+    the run as completed. So a failing validate (or reconcile or scope) gate in `build-rpivw`
+    looked like success, and rpivw closed the bead. Now only edges that can return `implement`
+    are wrapped (in rpiv-pi's real `build`: 3 of 13 function edges, and none of the
+    failure-stop gates), and wrappers (including `deviation-check`'s call to implement's own
+    edge) move each pick's note onto the edge the runner holds. Reproduced and re-checked
+    against rpiv-workflow 2.12.0's `routing-dsl.ts`. Audit of every run trail in the four
+    registered projects: no run was affected. The only `build-rpivw` run (creative_blog
+    `2026-10-04_09-59-19-dbdb`, bead rw-1x8) took no decision stop; validate passed and it
+    reached commit, so the bead closed correctly.
+
 - 2026-10-05: **M3 gaps closed (3 of 3).** Your notes at a gate now reach the implement lane:
   the decision is recorded in `metadata.rpiv.approvals[<gate>]`, and the stage that took it
   appends a marked `## Reviewer notes` section once to the plan the gate holds — the artifact

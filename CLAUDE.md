@@ -84,9 +84,10 @@ These hold on every machine. Paths use `~` for the home folder; on Windows that'
 - **rpivw** loads through a `packages` entry in Pi's settings that points at this checkout's
   `extension/` folder, so edits are live after `/reload`. Its warnings and errors are also logged to
   `<store>/.git/rpivw.log`.
-- **Extension tests:** `cd extension && node --test test/`. No dependencies and no build. Keep the
-  TypeScript erasable (type stripping) and use `.ts` import extensions. Tests that need `bd` skip
-  without it.
+- **Extension tests:** `cd extension && node --test test/`, then `npm run typecheck` (tsc --noEmit
+  against the installed Pi's types; needs `tsc` on PATH or npx). No dependencies and no build. Keep
+  the TypeScript erasable (type stripping) and use `.ts` import extensions. Tests that need `bd`
+  skip without it.
 - **beads and Dolt.** Tested with `bd` 1.3.1 and `dolt` 2.2.0. Any install method works (mise, a
   package manager, a release binary); rpivw finds `bd` via `RPIVW_BD`, then PATH, then mise's install
   folder. Don't upgrade them without the driver (see research 06). Parse `bd --json` from stdout only.
