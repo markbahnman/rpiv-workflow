@@ -12,15 +12,18 @@
 // - plan-approval (only for workflows in config gates.planApproval): first entry
 //   creates a beads `human` gate blocking the bead and throws, so rpiv halts the run
 //   ("stopped at plan-approval"). `/work approve` resolves it and resumes; rpiv
-//   re-runs the halted stage, which now passes.
+//   re-runs the halted stage, which now passes and hands the driver's notes to implement
+//   (src/notes.ts) before the run continues.
 // - deviation-check (always): halts while a major deviation (recorded by the
 //   work_deviation tool) is open. `/work approve <gate>` continues; `/work approve
-//   <gate> --reimplement` (after /skill:revise) routes back to `implement` once.
+//   <gate> --reimplement` (after /skill:revise) routes back to `implement` once, with
+//   the driver's notes appended to the plan the same way.
 //
 // A separate name means rpiv-pi re-registering `build` can never clobber the variant,
 // and a plain `/wf build` stays untouched.
 
-import { type Bead, type Beads, projectLabel } from "./beads.ts";
+import { type Bead, type Beads, approvalFor, projectLabel } from "./beads.ts";
+import { appendGateNotes } from "./notes.ts";
 
 export const PLAN_GATE = "plan-approval";
 export const DEVIATION_CHECK = "deviation-check";
@@ -200,6 +203,37 @@ export function findPlanPath(ctx: ScriptCtx): string | undefined {
 /** The bead a gate blocks, from bd's "Ad-hoc gate blocking <id>" description. */
 export const gateBlocks = (description: string | undefined) => description?.match(/gate blocking (\S+)/)?.[1];
 
+/**
+ * The driver's notes for a decided gate, appended once to the plan the next stage reads.
+ * Silent when they decided without a note, and when the notes are already in the file
+ * (resume re-runs the halted stage, so this runs more than once).
+ */
+async function applyGateNotes(
+  gate: Bead,
+  kind: "approval" | "deviation",
+  ctx: ScriptCtx,
+  beads: Beads,
+  bead: string,
+  notify: (msg: string, level?: "info" | "warning" | "error") => void,
+): Promise<void> {
+  try {
+    const note = approvalFor(await beads.show(bead), gate.id);
+    if (!note?.notes?.trim()) return;
+    // A plan gate records the plan in its reason; a deviation gate's reason is what the
+    // model found, so its plan comes from the run's own channels.
+    const plan = kind === "approval" ? gatePlan(gate.description) ?? findPlanPath(ctx) : findPlanPath(ctx);
+    if (!plan || plan === "the") {
+      notify(`rpivw: your ${kind} notes for gate ${gate.id} are on ${bead}; no plan artifact to add them to.`, kind === "approval" ? "warning" : "info");
+      return;
+    }
+    const outcome = appendGateNotes(plan, ctx.cwd, { gate: gate.id, kind, notes: note.notes, at: note.at, via: note.via });
+    if (outcome === "appended") notify(`rpivw: your ${kind} notes are in ${plan} (gate ${gate.id}), where implement will read them.`);
+    else if (outcome === "missing") notify(`rpivw: couldn't add your notes for gate ${gate.id}: no plan at ${plan}.`, "warning");
+  } catch (e) {
+    notify(`rpivw: couldn't add notes for gate ${gate.id}: ${(e as Error).message}`, "warning");
+  }
+}
+
 /** Plan path recorded in a gate's reason: "Reason: <plan> (run <id>)". */
 export const gatePlan = (description: string | undefined) => description?.match(/Reason: (\S+)/)?.[1];
 
@@ -239,7 +273,10 @@ export function makePlanGate(deps: GateDeps) {
     }
     const mine = (await deps.beads.gates()).filter((g) => g.await_id === runId && g.labels?.includes(GATE_LABEL));
     const latest = mine.at(-1);
-    if (latest?.status === "closed") return; // approved: continue into implement
+    if (latest?.status === "closed") {
+      await applyGateNotes(latest, "approval", ctx, deps.beads, bead, deps.notify);
+      return; // approved: continue into implement
+    }
     if (latest) throw new Error(awaitingPlan(latest.id));
 
     const plan = findPlanPath(ctx) ?? "the plan";
@@ -278,7 +315,10 @@ export function makeDeviationCheck(deps: GateDeps, g: Record<symbol, unknown> = 
     if (redo) {
       await deps.beads.updateLabels(redo.id, [REIMPLEMENTED_LABEL], [REIMPLEMENT_LABEL]);
       const { bead } = await deps.linkFor(ctx.cwd, runId);
-      if (bead) await deps.beads.comment(bead, `run ${runId}: re-running implement after deviation ${redo.id}`);
+      if (bead) {
+        await deps.beads.comment(bead, `run ${runId}: re-running implement after deviation ${redo.id}`);
+        await applyGateNotes(redo, "deviation", ctx, deps.beads, bead, deps.notify);
+      }
       setDeviationRoute("reimplement", g);
     }
   };

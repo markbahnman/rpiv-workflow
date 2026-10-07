@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { test } from "node:test";
 import type { Bead, BeadComment, Beads, RpivMeta } from "../src/beads.ts";
 import { recordDeviation } from "../src/deviation.ts";
@@ -140,7 +143,12 @@ function world() {
     ready: async () => [...beads.values()].filter((b) => b.status === "open" && b.issue_type !== "gate"),
     list: async () => [],
     claim: async () => {},
-    patchRpiv: async (_id, f): Promise<RpivMeta> => f({}),
+    patchRpiv: async (id, f): Promise<RpivMeta> => {
+      const b = beads.get(id)!;
+      const next = f({ ...((b.metadata?.rpiv as RpivMeta) ?? {}) });
+      b.metadata = { ...b.metadata, rpiv: next };
+      return next;
+    },
     comment: async (id, text) => void calls.push(`comment ${id}: ${text}`),
     comments: async (): Promise<BeadComment[]> => [],
     close: async () => {},
@@ -201,8 +209,11 @@ test("plan gate: halts with a new gate, halts again while open, passes once appr
   assert.equal((await w.api.gates()).length, 1, "no duplicate gate");
 
   assert.match(await workNext(wctx(w.api), ""), /awaiting you \(dash\):\n {2}rw-g1 {2}Plan approval: CSV export/);
+  const waiting = await workNext({ ...wctx(w.api), root: join(tmpdir(), "checkout") }, "");
+  assert.match(waiting, / {6}plan: \.rpiv\/artifacts\/plans\/p\.md\n {6}open: file:\/\/\/.*checkout\/\.rpiv\/artifacts\/plans\/p\.md/, "the gate shows the plan it holds");
   const rej = await workReject(wctx(w.api), "rw-g1 split the export into two phases");
-  assert.match(rej, /next: \/skill:revise \.rpiv\/artifacts\/plans\/p\.md split the export into two phases/);
+  assert.equal(rej.revise, "/skill:revise .rpiv/artifacts/plans/p.md split the export into two phases");
+  assert.match(rej.message, /recorded on rw-5b3; rw-g1 stays open/);
   await assert.rejects(workApprove(wctx(w.api), "rw-g1 --reimplement"), /applies to deviation gates/);
 
   const ok = await workApprove(wctx(w.api), "rw-g1 looks good, watch memory");
@@ -321,6 +332,92 @@ test("deviation-check passes unlinked runs; plain approve of a deviation continu
   const r = await workApprove(wctx(w.api), "rw-g1 fine as is");
   assert.equal(r.message, "deviation: continue as planned (rw-g1 for rw-5b3)");
   assert.ok(w.calls.includes("comment rw-5b3: deviation: continue as planned: fine as is (gate rw-g1)"));
+});
+
+test("the driver's approval notes land in the plan once, where implement reads them", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "rw-"));
+  try {
+    const plan = ".rpiv/artifacts/plans/p.md";
+    mkdirSync(join(dir, ".rpiv", "artifacts", "plans"), { recursive: true });
+    writeFileSync(join(dir, plan), "# Plan\n\nphase 1\n");
+    const w = world();
+    const notes: string[] = [];
+    const gate = makePlanGate({
+      beads: w.api,
+      takeRunId: () => "run-1",
+      linkFor: async () => ({ bead: "rw-5b3", projectKey: "k" }),
+      notify: (m) => notes.push(m),
+    });
+    const ctx = { cwd: dir, input: { artifacts: [{ handle: { kind: "fs", path: plan } }] } };
+
+    await assert.rejects(gate(ctx), /waiting for plan approval \(gate rw-g1\)/);
+    assert.equal(readFileSync(join(dir, plan), "utf8"), "# Plan\n\nphase 1\n", "an open gate doesn't touch the plan");
+
+    await workApprove(wctx(w.api), "rw-g1 split phase 2 into two slices");
+    await gate(ctx); // the resume that follows an approval
+    const body = readFileSync(join(dir, plan), "utf8");
+    assert.match(body, /^# Plan\n\nphase 1\n\n<!-- rpivw:notes rw-g1 -->\n## Reviewer notes \(plan gate rw-g1, \d{4}-\d\d-\d\d \d\d:\d\d via approve\)\n/);
+    assert.match(body, /Honor these notes when implementing\. Where they conflict with the plan above, they win\./);
+    assert.match(body, /split phase 2 into two slices\n$/);
+    assert.deepEqual(notes.at(-1), "rpivw: your approval notes are in .rpiv/artifacts/plans/p.md (gate rw-g1), where implement will read them.");
+    assert.equal(notes.length, 2, "one gate-ready notice, one notes notice");
+
+    await gate(ctx); // resumes replay the stage: no second copy
+    assert.equal(readFileSync(join(dir, plan), "utf8"), body);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a decision with no notes leaves the plan alone", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "rw-"));
+  try {
+    const plan = ".rpiv/artifacts/plans/p.md";
+    mkdirSync(join(dir, ".rpiv", "artifacts", "plans"), { recursive: true });
+    writeFileSync(join(dir, plan), "# Plan\n");
+    const w = world();
+    const notes: string[] = [];
+    const gate = makePlanGate({
+      beads: w.api,
+      takeRunId: () => "run-1",
+      linkFor: async () => ({ bead: "rw-5b3", projectKey: "k" }),
+      notify: (m) => notes.push(m),
+    });
+    const ctx = { cwd: dir, input: { artifacts: [{ handle: { kind: "fs", path: plan } }] } };
+    await assert.rejects(gate(ctx));
+    await workApprove(wctx(w.api), "rw-g1");
+    await gate(ctx);
+    assert.equal(readFileSync(join(dir, plan), "utf8"), "# Plan\n");
+    assert.equal(notes.length, 1, "only the gate-ready notice, nothing about notes");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a deviation's --reimplement notes land in the plan the re-implement reads", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "rw-"));
+  try {
+    const plan = ".rpiv/artifacts/plans/p.md";
+    mkdirSync(join(dir, ".rpiv", "artifacts", "plans"), { recursive: true });
+    writeFileSync(join(dir, plan), "# Plan\n");
+    const w = world();
+    const notes: string[] = [];
+    const g: Record<symbol, unknown> = {};
+    const check = makeDeviationCheck({ beads: w.api, takeRunId: () => "run-1", linkFor: async () => ({ bead: "rw-5b3" }), notify: (m) => notes.push(m) }, g);
+    await recordDeviation({ severity: "major", found: "server-side pagination", impact: "3-4", proposal: "revise" }, devDeps(w.api, []));
+    await workApprove(wctx(w.api), "rw-g1 --reimplement redo phase 3 against KV");
+
+    const ctx = { cwd: dir, state: { named: { plans: [{ artifacts: [{ handle: { kind: "fs", path: plan } }] }] } } };
+    await check(ctx);
+    const body = readFileSync(join(dir, plan), "utf8");
+    assert.match(body, /<!-- rpivw:notes rw-g1 -->\n## Reviewer notes \(deviation gate rw-g1, .* via approve\)\n/);
+    assert.match(body, /redo phase 3 against KV/);
+    assert.deepEqual(notes, ["rpivw: your deviation notes are in .rpiv/artifacts/plans/p.md (gate rw-g1), where implement will read them."]);
+    await check(ctx); // the re-implement pass itself, and any later resume
+    assert.equal(readFileSync(join(dir, plan), "utf8"), body);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 // ---------------------------------------------------------------- start mapping

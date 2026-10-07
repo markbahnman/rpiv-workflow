@@ -1,7 +1,10 @@
 // `/work new | next | start | status <bead>`: the beads side of the command, kept
 // free of Pi types so it can be tested with a fake Beads.
 
-import { type Bead, type Beads, projectLabel, rpivMeta, titleFromBrief } from "./beads.ts";
+import { isAbsolute, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
+
+import { type Bead, type Beads, projectLabel, rpivMeta, titleFromBrief, type Approval } from "./beads.ts";
 import {
   approveHint,
   baseName,
@@ -22,6 +25,8 @@ export interface WorkCtx {
   project?: { key: string; name: string };
   /** name per key, for labeling cross-project lists. */
   projectNames: Record<string, string>;
+  /** Checkout root, so gate notices can print an absolute link. */
+  root?: string;
   /** Base workflows /work start runs as <name>-rpivw (default TRACKED_BASES). */
   tracked?: string[];
 }
@@ -94,7 +99,7 @@ export async function workNext(ctx: WorkCtx, args: string): Promise<string> {
   if (waiting.length) {
     out.push(
       `awaiting you (${scope}):`,
-      ...waiting.map((g) => `  ${g.id}  ${g.title}  →  ${gateHint(g)}`),
+      ...waiting.map((g) => [`  ${g.id}  ${g.title}  →  ${gateHint(g)}`, ...gatePlanLines(g, ctx)].join("\n")),
     );
   }
   if (doing.length) out.push(`in progress (${scope}):`, ...doing.map((b) => `  ${line(b, ctx, all)}`));
@@ -184,6 +189,26 @@ export async function openGates(ctx: WorkCtx, all = false): Promise<Bead[]> {
 export const isDeviationGate = (g: Bead) => !!g.labels?.includes(DEVIATION_LABEL);
 export const gateHint = (g: Bead) => (isDeviationGate(g) ? deviationHint(g.id) : approveHint(g.id));
 
+/**
+ * The plan a gate recorded, as lines under its "awaiting you" entry: the path (clickable
+ * in most terminals) and a file:// link. M5 adds a link to the rendered plan.
+ */
+function gatePlanLines(g: Bead, ctx: WorkCtx): string[] {
+  const plan = gatePlan(g.description);
+  if (!plan || plan === "the") return [];
+  const abs = isAbsolute(plan) ? plan : ctx.root ? resolve(ctx.root, plan) : undefined;
+  return [`      plan: ${plan}`, ...(abs ? [`      open: ${pathToFileURL(abs).href}`] : [])];
+}
+
+/** Record a decision in metadata.rpiv.approvals so the gate stage can find it on resume. */
+async function recordApproval(beads: Beads, bead: string | undefined, gateId: string, notes: string, via: Approval["via"]): Promise<void> {
+  if (!bead) return;
+  await beads.patchRpiv(bead, (m) => ({
+    ...m,
+    approvals: { ...m.approvals, [gateId]: { ...(notes.trim() ? { notes: notes.trim() } : {}), at: new Date().toISOString(), via } },
+  }));
+}
+
 async function openGate(ctx: WorkCtx, id: string | undefined, usage: string): Promise<Bead> {
   if (!id) throw new Error(usage);
   const g = await ctx.beads.show(id);
@@ -219,6 +244,7 @@ export async function workApprove(ctx: WorkCtx, args: string): Promise<ApproveRe
     what = "plan approved";
   }
   if (bead) await ctx.beads.comment(bead, `${what}${notes ? `: ${notes}` : ""} (gate ${g.id})`);
+  await recordApproval(ctx.beads, bead, g.id, notes, "approve");
   await ctx.beads.resolveGate(g.id);
   return { message: `${what} (${g.id}${bead ? ` for ${bead}` : ""})`, runId: g.await_id };
 }
@@ -252,6 +278,7 @@ export async function applyPlanReview(ctx: WorkCtx, gateId: string, d: PlanRevie
   const bead = gateBlocks(g.description);
   if (d.approved) {
     if (bead) await ctx.beads.comment(bead, `plan approved in plannotator${notes ? `: ${clip(notes)}` : ""} (gate ${g.id})`);
+    await recordApproval(ctx.beads, bead, g.id, notes, "plannotator");
     await ctx.beads.resolveGate(g.id);
     return { message: `plan approved in plannotator (${g.id}${bead ? ` for ${bead}` : ""})`, runId: g.await_id };
   }
@@ -266,8 +293,11 @@ export async function applyPlanReview(ctx: WorkCtx, gateId: string, d: PlanRevie
   };
 }
 
-/** /work reject <gate> <notes> — record requested changes; the gate stays open until the revised plan is approved. */
-export async function workReject(ctx: WorkCtx, args: string): Promise<string> {
+/**
+ * /work reject <gate> <notes> — record requested changes and start the revise. The gate
+ * stays open until the revised plan is approved.
+ */
+export async function workReject(ctx: WorkCtx, args: string): Promise<RejectResult> {
   const [id, ...rest] = args.trim().split(/\s+/);
   const g = await openGate(ctx, id, "usage: /work reject <gate> <notes>");
   if (isDeviationGate(g)) throw new Error(`${g.id} is a deviation. Decide it with ${deviationHint(g.id)}`);
@@ -276,9 +306,18 @@ export async function workReject(ctx: WorkCtx, args: string): Promise<string> {
   const bead = gateBlocks(g.description);
   if (bead) await ctx.beads.comment(bead, `plan changes requested (gate ${g.id}): ${notes}`);
   const plan = gatePlan(g.description);
-  return [
-    `recorded on ${bead ?? g.id}. The gate stays open.`,
-    `next: /skill:revise ${plan ?? "<plan>"} ${notes}`,
-    `then: /work approve ${g.id}`,
-  ].join("\n");
+  return {
+    message: [
+      `recorded on ${bead ?? g.id}; ${g.id} stays open.`,
+      plan ? `revising ${plan} now — approve it again with /work approve ${g.id} when it reads right.` : `revise the plan, then /work approve ${g.id}.`,
+    ].join("\n"),
+    revise: plan ? `/skill:revise ${plan} ${notes}` : undefined,
+  };
+}
+
+/** What /work reject reports back, plus the revise to start. */
+export interface RejectResult {
+  message: string;
+  /** `/skill:revise <plan> <notes>`, when the gate recorded a plan. */
+  revise?: string;
 }

@@ -39,11 +39,23 @@ export interface RpivMeta {
   /** Latest artifact per bucket, store-relative: { plans: "plans/x.md" } */
   artifacts?: Record<string, string>;
   origin?: { artifact: string; section?: string };
+  /** Decisions the driver made at rpivw gates, by gate id (M3). */
+  approvals?: Record<string, Approval>;
+}
+
+/** A decision at a plan-approval or deviation gate. */
+export interface Approval {
+  /** What the driver wrote; undefined when they decided without a note. */
+  notes?: string;
+  at: string;
+  via: "approve" | "plannotator";
 }
 
 export const projectLabel = (key: string) => `project:${key}`;
 
 export const rpivMeta = (b: Bead): RpivMeta => ((b.metadata?.rpiv as RpivMeta | undefined) ?? {});
+
+export const approvalFor = (b: Bead, gateId: string): Approval | undefined => rpivMeta(b).approvals?.[gateId];
 
 type Runner = (cmd: string, args: string[], opts: { cwd?: string; env?: NodeJS.ProcessEnv; timeoutMs?: number }) => Promise<ExecResult>;
 

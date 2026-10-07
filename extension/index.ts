@@ -60,7 +60,7 @@ const USAGE = [
   "/work status [<bead>]              store/project state, or one bead's phase, runs, artifacts, notes",
   "/work review [<gate>]              open a plan waiting for approval (plannotator if installed, file link, hunk diff of changes)",
   "/work approve <gate> [notes] [--reimplement]  approve a plan (or decide a deviation) and resume the run",
-  "/work reject <gate> <notes>        request plan changes (the gate stays open)",
+  "/work reject <gate> <notes>        request plan changes and start /skill:revise (the gate stays open until you approve it)",
   "/work init [name] [--migrate] [--git]  register this repo (or rename it) and mount its store folder;\n                                   creates the git repo if missing (asks, or --git)",
   "/work mount                        (re)create the .rpiv/artifacts junction",
   "/work sync                         push the store (git + beads) to its remote",
@@ -461,13 +461,20 @@ export default function rpivw(pi: ExtensionAPI) {
           beads,
           project: info && entry ? { key: info.key, name: entry.name } : undefined,
           projectNames: Object.fromEntries(Object.entries(reg.projects).map(([k, v]) => [k, v.name])),
+          root: info?.root,
         };
         try {
           completionCache = undefined;
           if (sub === "new") say(await workNew(wctx, restArgs));
           else if (sub === "next") say(await workNext(wctx, restArgs));
           else if (sub === "status") say(await workBeadStatus(wctx, rest[0]));
-          else if (sub === "reject") say(await workReject(wctx, restArgs));
+          else if (sub === "reject") {
+            // The command opens the revise itself: the driver asked for changes, so the plan
+            // edit is the next thing they want, and /skill:revise keeps the gate's trail.
+            const r = await workReject(wctx, restArgs);
+            say(`rpivw: ${r.message}`);
+            if (r.revise) pi.sendUserMessage(r.revise, { expandPromptTemplates: true });
+          }
           else if (sub === "review") {
             if (!info) throw new Error("run /work review from the project's checkout.");
             let gate: Bead | undefined;
