@@ -24,6 +24,27 @@ Phases 2 and 3 interleave: M0–M2 have to exist before the mocks can run for re
 
 ## Done
 
+- 2026-10-12: **A stopped run's report was lost to a Windows command-line limit, and the spawn
+  failure underneath hid which tool failed.** Found driving the bead-board run
+  `2026-10-06_22-34-07-c86b` (bead rw-2l1) to its stop at rpiv-pi's `implement-scope-check`. 92 tests.
+  - `onWorkflowEnd` posts the full stop report as one `bd comments add` argument; this run's report
+    measured **125,286 chars** against Windows' 32,767-char `CreateProcess` cap. `execFile` fails
+    that case by throwing **synchronously**, so the throw bypassed `exec.ts`'s `{code, stderr}`
+    mapping *and* `beads.ts`'s `bd <verb> failed:` prefix — the log read only
+    `rpivw: spawn ENAMETOOLONG`, naming no tool, and the comment was silently dropped (the store
+    commit, trail archive, and stage records all landed first).
+  - Fix: `beads.comment` writes text over 8,000 chars to a temp file and calls
+    `bd comments add -f <file>` (verified end-to-end against real bd 1.3.1 with a 125 KB comment,
+    which lands intact and is deleted afterwards); `exec.ts` maps a synchronous spawn throw into the
+    same `{code, stderr}` shape as an exit, so no caller can lose its prefix again. New
+    `test/exec.test.ts`, plus a fake-bd test for the file path and the short-comment argv path.
+  - Not a rpivw defect, recorded for the next run: rpiv-pi's unsliced `ship` routes
+    `implement-scope-check` with a pass-only `match("verdict", { reconcile: "pass" })`, so its
+    tiered `untracked-only`/`excess` verdicts are terminal there by design (build/vet route them to
+    `scope-quarantine`). A checkout with **no commits** always yields `untracked-only`, because the
+    floor's dirty set is `git status --porcelain` and every file is `??`. The target repo now has its
+    baseline commit, which is what the floor needs to mean anything.
+
 - 2026-10-07: **Code review fixes.** A whole-extension review (checked against rpiv-* 2.12.0)
   found a blocker, five concerns, and two smaller issues; all are fixed. 89 tests.
   - Gate stages read the run id from their input envelopes (`OutputMeta.runId`) instead of a

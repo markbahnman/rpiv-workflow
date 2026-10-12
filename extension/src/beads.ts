@@ -8,12 +8,24 @@
 //    queue lives on globalThis, per store: rpiv stage child sessions load their own copy
 //    of this extension in the same process, and their bd calls must wait in the same line.
 
+import { rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { bdPath } from "./bin.ts";
 import { type ExecResult, run as defaultRun } from "./exec.ts";
 import { pathKey } from "./paths.ts";
 
 const QUEUES = Symbol.for("rpivw:bd-queues");
+
+/**
+ * Longest comment text passed as an argv element. Windows caps a whole command line
+ * (CreateProcess) at 32,767 chars, and a stopped run's full report runs to ~125 KB —
+ * far past it. Above this, `comment` hands bd a file instead (`comments add -f`).
+ */
+const COMMENT_ARGV_MAX = 8_000;
+
+/** Distinguishes the temp comment files one process writes; each is removed right after its bd call. */
+let commentFiles = 0;
 
 /** The process-wide bd queue for one store: `enqueue(fn)` runs `fn` after every job queued before it. */
 function sharedQueue(storeRoot: string, g: Record<symbol, unknown>) {
@@ -168,7 +180,18 @@ export function openBeads(storeRoot: string, runner: Runner = defaultRun, bin?: 
         return next;
       }),
     comment: async (id, text) => {
-      await raw(["comments", "add", id, text]);
+      if (text.length <= COMMENT_ARGV_MAX) {
+        await raw(["comments", "add", id, text]);
+        return;
+      }
+      // A file keeps the comment lossless (and unquotable): `bd comments add -f <path>`.
+      const file = join(tmpdir(), `rpivw-comment-${process.pid}-${++commentFiles}-${Date.now()}.md`);
+      writeFileSync(file, text, "utf8");
+      try {
+        await raw(["comments", "add", id, "-f", file]);
+      } finally {
+        rmSync(file, { force: true });
+      }
     },
     comments: async (id) => many<BeadComment>(["comments", id]),
     close: async (id, reason) => {

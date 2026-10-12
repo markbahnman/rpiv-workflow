@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -263,4 +263,35 @@ test("childRunId recognizes rpiv stage child sessions and extracts the run id", 
   assert.equal(childRunId("/home/me/proj/.rpiv/workflows/runs/r1/sessions/"), "r1");
   assert.equal(childRunId("C:\\Users\\me\\.pi\\agent\\sessions\\--C--Users-me-proj--"), undefined, "launcher session");
   assert.equal(childRunId(undefined), undefined);
+});
+
+// ---------------------------------------------------------------- long comments (fake bd)
+
+test("a comment past the argv limit goes to bd as a file, lossless and cleaned up", async () => {
+  // A stopped run's full report runs to ~125 KB; Windows caps a command line at 32,767
+  // chars, where execFile throws synchronously (spawn ENAMETOOLONG).
+  const calls: string[][] = [];
+  const readAtCall: string[] = [];
+  let filePath: string | undefined;
+  const runner = async (_cmd: string, args: string[]) => {
+    calls.push(args);
+    const at = args.indexOf("-f");
+    if (at >= 0) {
+      filePath = args[at + 1];
+      readAtCall.push(readFileSync(filePath, "utf8"));
+    }
+    return { code: 0, stdout: "{}", stderr: "" };
+  };
+  const bd = openBeads("/store", runner, "bd", {});
+  const long = `✗ stopped at implement-scope-check\n${"detail ".repeat(2_000)}`;
+
+  await bd.comment("rw-1", long);
+
+  assert.deepEqual(calls[0].slice(0, 3), ["comments", "add", "rw-1"]);
+  assert.equal(readAtCall[0], long, "bd read the whole comment from the file");
+  assert.ok(filePath && !existsSync(filePath), "the temp file is removed after the call");
+
+  await bd.comment("rw-1", "short");
+
+  assert.deepEqual(calls[1], ["comments", "add", "rw-1", "short"], "short comments stay on argv");
 });
